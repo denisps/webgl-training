@@ -13,6 +13,7 @@
       .controls { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; margin-bottom: 1rem; }
       button, input { background: #1e293b; color: #e2e8f0; border: 1px solid #334155; border-radius: 0.5rem; padding: 0.5rem 0.75rem; }
       button { cursor: pointer; }
+      input[type="number"] { width: 3.5rem; }
       canvas { max-width: 100%; border-radius: 0.5rem; background: #020617; }
       .status { color: #94a3b8; font-size: 0.95rem; }
       .prediction { font-size: 1rem; line-height: 1.6; }
@@ -34,10 +35,11 @@
           <button id="loadImageBtn">Load map image</button>
           <button id="downloadBtn">Download weights</button>
           <button id="uploadBtn">Upload weights</button>
+          <label>Regions <input id="regionsInput" type="number" min="2" max="16" value="8" /></label>
           <label>LR <input id="lrInput" type="range" min="0.0005" max="0.02" step="0.0005" value="0.004" /></label>
           <label>Epochs <input id="epochsInput" type="number" min="1" max="200" value="20" /></label>
         </div>
-        <canvas id="mapCanvas" width="256" height="256"></canvas>
+        <canvas id="mapCanvas" width="512" height="512"></canvas>
         <p class="status" id="status"></p>
       </section>
       <section>
@@ -45,7 +47,7 @@
         <canvas id="lossCanvas" width="360" height="180"></canvas>
         <p class="status" id="epochLabel">Epoch: 0</p>
         <h2>Testing</h2>
-        <canvas id="patchCanvas" width="128" height="128"></canvas>
+        <canvas id="patchCanvas" width="256" height="256"></canvas>
         <div class="prediction" id="predictionLabel">Click the map to test a patch.</div>
       </section>
     </main>
@@ -83,18 +85,14 @@
       const statusLabel = document.getElementById('status');
       const epochLabel = document.getElementById('epochLabel');
       const predictionLabel = document.getElementById('predictionLabel');
-      const trainBtn = document.getElementById('trainBtn');
-      const stopBtn = document.getElementById('stopBtn');
-      const resetBtn = document.getElementById('resetBtn');
-      const downloadBtn = document.getElementById('downloadBtn');
-      const uploadBtn = document.getElementById('uploadBtn');
       const lrInput = document.getElementById('lrInput');
       const epochsInput = document.getElementById('epochsInput');
+      const regionsInput = document.getElementById('regionsInput');
 
       const gl = createWebGL2Context(document.createElement('canvas'));
       const programs = buildProgramCache(gl, shaderSources);
       const patchSize = 32;
-      const nRegions = 8;
+      const MAX_PREVIEW_PX = 512;
       const DEFAULT_MAP_SIZE = 256;
       let mapWidth = DEFAULT_MAP_SIZE;
       let mapHeight = DEFAULT_MAP_SIZE;
@@ -105,14 +103,73 @@
       let lossHistory = [];
       let stopRequested = false;
 
+      // Scale patchesPerRegion with the square root of image area so larger
+      // maps get proportionally more training samples, capped for performance.
+      function computePatchesPerRegion() {
+        return Math.max(24, Math.min(200, Math.round(Math.sqrt(mapWidth * mapHeight) / 6)));
+      }
+
+      // Resize the map canvas to fit within MAX_PREVIEW_PX while preserving
+      // the image aspect ratio.
+      function resizeMapCanvas() {
+        const scale = MAX_PREVIEW_PX / Math.max(mapWidth, mapHeight);
+        mapCanvas.width = Math.round(mapWidth * scale);
+        mapCanvas.height = Math.round(mapHeight * scale);
+      }
+
+      // Draw semi-transparent grid lines that show the region boundaries.
+      function drawRegionGuidelines() {
+        const { gridCols, gridRows } = mapState;
+        if (!gridCols || !gridRows) return;
+        const ctx = mapCanvas.getContext('2d');
+        ctx.save();
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        for (let col = 1; col < gridCols; col += 1) {
+          const x = Math.round(col * mapCanvas.width / gridCols) + 0.5;
+          ctx.moveTo(x, 0);
+          ctx.lineTo(x, mapCanvas.height);
+        }
+        for (let row = 1; row < gridRows; row += 1) {
+          const y = Math.round(row * mapCanvas.height / gridRows) + 0.5;
+          ctx.moveTo(0, y);
+          ctx.lineTo(mapCanvas.width, y);
+        }
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      // Draw a subtle per-pixel grid on the patch canvas to show individual
+      // patch pixels when the patch is scaled up.
+      function drawPatchPixelGrid() {
+        const ctx = patchCanvas.getContext('2d');
+        const cellW = patchCanvas.width / patchSize;
+        const cellH = patchCanvas.height / patchSize;
+        ctx.save();
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
+        ctx.lineWidth = 0.5;
+        ctx.beginPath();
+        for (let col = 1; col < patchSize; col += 1) {
+          const x = col * cellW + 0.5;
+          ctx.moveTo(x, 0);
+          ctx.lineTo(x, patchCanvas.height);
+        }
+        for (let row = 1; row < patchSize; row += 1) {
+          const y = row * cellH + 0.5;
+          ctx.moveTo(0, y);
+          ctx.lineTo(patchCanvas.width, y);
+        }
+        ctx.stroke();
+        ctx.restore();
+      }
+
       function drawLoss() {
         const ctx = lossCanvas.getContext('2d');
         ctx.clearRect(0, 0, lossCanvas.width, lossCanvas.height);
         ctx.fillStyle = '#020617';
         ctx.fillRect(0, 0, lossCanvas.width, lossCanvas.height);
-        if (lossHistory.length < 2) {
-          return;
-        }
+        if (lossHistory.length < 2) return;
         const maxLoss = Math.max(...lossHistory);
         const minLoss = Math.min(...lossHistory);
         ctx.strokeStyle = '#38bdf8';
@@ -126,41 +183,69 @@
         ctx.stroke();
       }
 
-      // For loaded images use the stored ImageBitmap so the browser handles
-      // scaling to the canvas size without needing an equally-large canvas.
       function renderMap() {
         const ctx = mapCanvas.getContext('2d');
         if (mapState.bitmap) {
           ctx.clearRect(0, 0, mapCanvas.width, mapCanvas.height);
           ctx.drawImage(mapState.bitmap, 0, 0, mapCanvas.width, mapCanvas.height);
         } else {
-          ctx.putImageData(new ImageData(mapState.imageData, mapWidth, mapHeight), 0, 0);
+          const temp = document.createElement('canvas');
+          temp.width = mapWidth;
+          temp.height = mapHeight;
+          temp.getContext('2d').putImageData(new ImageData(mapState.imageData, mapWidth, mapHeight), 0, 0);
+          ctx.clearRect(0, 0, mapCanvas.width, mapCanvas.height);
+          ctx.drawImage(temp, 0, 0, mapCanvas.width, mapCanvas.height);
         }
+        drawRegionGuidelines();
       }
 
       function renderPatch(patch) {
-        const ctx = patchCanvas.getContext('2d');
-        const image = ctx.createImageData(patchSize, patchSize);
-        for (let index = 0; index < patchSize * patchSize; index += 1) {
-          image.data[index * 4 + 0] = Math.max(0, Math.min(255, (patch[index * 3 + 0] + 1) * 127.5));
-          image.data[index * 4 + 1] = Math.max(0, Math.min(255, (patch[index * 3 + 1] + 1) * 127.5));
-          image.data[index * 4 + 2] = Math.max(0, Math.min(255, (patch[index * 3 + 2] + 1) * 127.5));
-          image.data[index * 4 + 3] = 255;
+        const image = new ImageData(patchSize, patchSize);
+        for (let i = 0; i < patchSize * patchSize; i += 1) {
+          image.data[i * 4 + 0] = Math.max(0, Math.min(255, (patch[i * 3 + 0] + 1) * 127.5));
+          image.data[i * 4 + 1] = Math.max(0, Math.min(255, (patch[i * 3 + 1] + 1) * 127.5));
+          image.data[i * 4 + 2] = Math.max(0, Math.min(255, (patch[i * 3 + 2] + 1) * 127.5));
+          image.data[i * 4 + 3] = 255;
         }
         const temp = document.createElement('canvas');
         temp.width = patchSize;
         temp.height = patchSize;
         temp.getContext('2d').putImageData(image, 0, 0);
+        const ctx = patchCanvas.getContext('2d');
         ctx.imageSmoothingEnabled = false;
         ctx.clearRect(0, 0, patchCanvas.width, patchCanvas.height);
         ctx.drawImage(temp, 0, 0, patchCanvas.width, patchCanvas.height);
+        drawPatchPixelGrid();
       }
 
-      function rebuild() {
-        mapWidth = DEFAULT_MAP_SIZE;
-        mapHeight = DEFAULT_MAP_SIZE;
-        mapState = generateMap(mapWidth, mapHeight, nRegions);
-        dataset = createDataset(...Object.values(generateTrainingPatches(mapState.imageData, mapState.regionMask, mapWidth, mapHeight, patchSize, 48)));
+      // Extract raw RGBA pixels from an arbitrary-sized image file using 2048-px
+      // canvas tiles so no single canvas allocation exceeds the texture size limit.
+      async function loadImageFromFile(file) {
+        const bitmap = await createImageBitmap(file);
+        const { width, height } = bitmap;
+        const imageData = new Uint8ClampedArray(width * height * 4);
+        const tileSize = 2048;
+        for (let ty = 0; ty < height; ty += tileSize) {
+          const tileH = Math.min(tileSize, height - ty);
+          for (let tx = 0; tx < width; tx += tileSize) {
+            const tileW = Math.min(tileSize, width - tx);
+            const tile = document.createElement('canvas');
+            tile.width = tileW;
+            tile.height = tileH;
+            const tileCtx = tile.getContext('2d');
+            tileCtx.drawImage(bitmap, -tx, -ty);
+            const tilePixels = tileCtx.getImageData(0, 0, tileW, tileH).data;
+            for (let row = 0; row < tileH; row += 1) {
+              const src = row * tileW * 4;
+              const dst = ((ty + row) * width + tx) * 4;
+              imageData.set(tilePixels.subarray(src, src + tileW * 4), dst);
+            }
+          }
+        }
+        return { bitmap, width, height, imageData };
+      }
+
+      function resetModel(nRegions) {
         model = createMapModel(gl, nRegions);
         trainer = createTrainer(gl, programs, model, {
           lr: Number(lrInput.value),
@@ -170,10 +255,44 @@
           batchSize: 16,
           loss: 'crossEntropy',
         });
+      }
+
+      function initFromGeneratedMap() {
+        const nRegions = Number(regionsInput.value);
+        mapWidth = DEFAULT_MAP_SIZE;
+        mapHeight = DEFAULT_MAP_SIZE;
+        mapState = generateMap(mapWidth, mapHeight, nRegions);
+        const samples = computePatchesPerRegion();
+        dataset = createDataset(...Object.values(
+          generateTrainingPatches(mapState.imageData, mapState.regionMask, mapWidth, mapHeight, patchSize, samples)
+        ));
+        resetModel(nRegions);
         lossHistory = [];
         epochLabel.textContent = 'Epoch: 0';
         statusLabel.textContent = `Dataset: ${dataset.size} samples across ${nRegions} regions.`;
         predictionLabel.textContent = 'Click the map to test a patch.';
+        resizeMapCanvas();
+        renderMap();
+        drawLoss();
+      }
+
+      async function initFromImageFile(file) {
+        const nRegions = Number(regionsInput.value);
+        const { bitmap, width, height, imageData } = await loadImageFromFile(file);
+        mapWidth = width;
+        mapHeight = height;
+        const { regionMask, gridCols, gridRows } = assignRegionsByGrid(width, height, nRegions);
+        mapState = { imageData, regionMask, bitmap, gridCols, gridRows };
+        const samples = computePatchesPerRegion();
+        dataset = createDataset(...Object.values(
+          generateGridTrainingPatches(imageData, width, height, gridCols, gridRows, patchSize, samples)
+        ));
+        resetModel(nRegions);
+        lossHistory = [];
+        epochLabel.textContent = 'Epoch: 0';
+        statusLabel.textContent = `Image: ${width}×${height}px (${gridCols}×${gridRows} regions) | ${dataset.size} samples.`;
+        predictionLabel.textContent = 'Click the map to test a patch.';
+        resizeMapCanvas();
         renderMap();
         drawLoss();
       }
@@ -217,33 +336,6 @@
         const y = Math.max(0, Math.min(mapHeight - 1, Math.floor((event.clientY - rect.top) * mapHeight / rect.height)));
         predictAt(x, y);
       });
-      // --------------- image loader ---------------
-      // Extract raw RGBA pixels from an arbitrary-sized image using 2048-px
-      // tiles so we never allocate a canvas larger than the texture size limit.
-      async function loadImageFromFile(file) {
-        const bitmap = await createImageBitmap(file);
-        const { width, height } = bitmap;
-        const imageData = new Uint8ClampedArray(width * height * 4);
-        const tileSize = 2048;
-        for (let ty = 0; ty < height; ty += tileSize) {
-          const tileH = Math.min(tileSize, height - ty);
-          for (let tx = 0; tx < width; tx += tileSize) {
-            const tileW = Math.min(tileSize, width - tx);
-            const tile = document.createElement('canvas');
-            tile.width = tileW;
-            tile.height = tileH;
-            const tileCtx = tile.getContext('2d');
-            tileCtx.drawImage(bitmap, -tx, -ty);
-            const tilePixels = tileCtx.getImageData(0, 0, tileW, tileH).data;
-            for (let row = 0; row < tileH; row += 1) {
-              const src = row * tileW * 4;
-              const dst = ((ty + row) * width + tx) * 4;
-              imageData.set(tilePixels.subarray(src, src + tileW * 4), dst);
-            }
-          }
-        }
-        return { bitmap, width, height, imageData };
-      }
 
       document.getElementById('loadImageBtn').addEventListener('click', () => {
         const fileInput = document.createElement('input');
@@ -252,44 +344,20 @@
         fileInput.addEventListener('change', async (event) => {
           const file = event.target.files[0];
           if (!file) return;
-          statusLabel.textContent = 'Loading image…';
           try {
-            const { bitmap, width, height, imageData } = await loadImageFromFile(file);
-            mapWidth = width;
-            mapHeight = height;
-            const { regionMask, gridCols, gridRows } = assignRegionsByGrid(width, height, nRegions);
-            mapState = { imageData, regionMask, bitmap };
-            dataset = createDataset(...Object.values(
-              generateGridTrainingPatches(imageData, width, height, gridCols, gridRows, patchSize, 48)
-            ));
-            model = createMapModel(gl, nRegions);
-            trainer = createTrainer(gl, programs, model, {
-              lr: Number(lrInput.value),
-              beta1: 0.9,
-              beta2: 0.999,
-              eps: 1e-8,
-              batchSize: 16,
-              loss: 'crossEntropy',
-            });
-            lossHistory = [];
-            epochLabel.textContent = 'Epoch: 0';
-            statusLabel.textContent = `Image: ${width}×${height}px (${gridCols}×${gridRows} region grid) | Dataset: ${dataset.size} samples.`;
-            predictionLabel.textContent = 'Click the map to test a patch.';
-            renderMap();
-            drawLoss();
+            await initFromImageFile(file);
           } catch (error) {
             statusLabel.textContent = `Error loading image: ${error.message}`;
           }
         });
         fileInput.click();
       });
-      // -----------------------------------------------
 
-      trainBtn.addEventListener('click', train);
-      stopBtn.addEventListener('click', () => { stopRequested = true; });
-      resetBtn.addEventListener('click', rebuild);
-      downloadBtn.addEventListener('click', () => downloadWeights(gl, model.parameters, 'map-location-weights.json'));
-      uploadBtn.addEventListener('click', async () => {
+      document.getElementById('trainBtn').addEventListener('click', train);
+      document.getElementById('stopBtn').addEventListener('click', () => { stopRequested = true; });
+      document.getElementById('resetBtn').addEventListener('click', initFromGeneratedMap);
+      document.getElementById('downloadBtn').addEventListener('click', () => downloadWeights(gl, model.parameters, 'map-location-weights.json'));
+      document.getElementById('uploadBtn').addEventListener('click', async () => {
         const parsed = await loadWeightsFromFile();
         if (parsed) {
           loadModelWeights(gl, model, parsed);
@@ -297,7 +365,7 @@
         }
       });
 
-      rebuild();
+      initFromGeneratedMap();
       renderPatch(extractPatch(mapState.imageData, mapWidth, mapWidth / 2, mapHeight / 2, patchSize));
     </script>
   </body>

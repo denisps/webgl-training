@@ -31,6 +31,7 @@
           <button id="trainBtn">Train</button>
           <button id="stopBtn">Stop</button>
           <button id="resetBtn">Reset</button>
+          <button id="loadImageBtn">Load map image</button>
           <button id="downloadBtn">Download weights</button>
           <button id="uploadBtn">Upload weights</button>
           <label>LR <input id="lrInput" type="range" min="0.0005" max="0.02" step="0.0005" value="0.004" /></label>
@@ -63,7 +64,7 @@
       import { downloadWeights, loadWeightsFromFile } from '../../src/utils/serialize.js';
       import { loadModelWeights } from '../../src/inference/model.js';
       import { runBatchInference } from '../../src/inference/runner.js';
-      import { generateMap, generateTrainingPatches, extractPatch } from './mapgen.js';
+      import { generateMap, generateTrainingPatches, extractPatch, assignRegionsByGrid, generateGridTrainingPatches } from './mapgen.js';
       import { createMapModel } from './model.js';
 
       const shaderSources = {
@@ -94,8 +95,9 @@
       const programs = buildProgramCache(gl, shaderSources);
       const patchSize = 32;
       const nRegions = 8;
-      const mapWidth = 256;
-      const mapHeight = 256;
+      const DEFAULT_MAP_SIZE = 256;
+      let mapWidth = DEFAULT_MAP_SIZE;
+      let mapHeight = DEFAULT_MAP_SIZE;
       let mapState;
       let dataset;
       let model;
@@ -124,10 +126,16 @@
         ctx.stroke();
       }
 
+      // For loaded images use the stored ImageBitmap so the browser handles
+      // scaling to the canvas size without needing an equally-large canvas.
       function renderMap() {
         const ctx = mapCanvas.getContext('2d');
-        const imageData = new ImageData(mapState.imageData, mapWidth, mapHeight);
-        ctx.putImageData(imageData, 0, 0);
+        if (mapState.bitmap) {
+          ctx.clearRect(0, 0, mapCanvas.width, mapCanvas.height);
+          ctx.drawImage(mapState.bitmap, 0, 0, mapCanvas.width, mapCanvas.height);
+        } else {
+          ctx.putImageData(new ImageData(mapState.imageData, mapWidth, mapHeight), 0, 0);
+        }
       }
 
       function renderPatch(patch) {
@@ -149,6 +157,8 @@
       }
 
       function rebuild() {
+        mapWidth = DEFAULT_MAP_SIZE;
+        mapHeight = DEFAULT_MAP_SIZE;
         mapState = generateMap(mapWidth, mapHeight, nRegions);
         dataset = createDataset(...Object.values(generateTrainingPatches(mapState.imageData, mapState.regionMask, mapWidth, mapHeight, patchSize, 48)));
         model = createMapModel(gl, nRegions);
@@ -207,6 +217,74 @@
         const y = Math.max(0, Math.min(mapHeight - 1, Math.floor((event.clientY - rect.top) * mapHeight / rect.height)));
         predictAt(x, y);
       });
+      // --------------- image loader ---------------
+      // Extract raw RGBA pixels from an arbitrary-sized image using 2048-px
+      // tiles so we never allocate a canvas larger than the texture size limit.
+      async function loadImageFromFile(file) {
+        const bitmap = await createImageBitmap(file);
+        const { width, height } = bitmap;
+        const imageData = new Uint8ClampedArray(width * height * 4);
+        const tileSize = 2048;
+        for (let ty = 0; ty < height; ty += tileSize) {
+          const tileH = Math.min(tileSize, height - ty);
+          for (let tx = 0; tx < width; tx += tileSize) {
+            const tileW = Math.min(tileSize, width - tx);
+            const tile = document.createElement('canvas');
+            tile.width = tileW;
+            tile.height = tileH;
+            const tileCtx = tile.getContext('2d');
+            tileCtx.drawImage(bitmap, -tx, -ty);
+            const tilePixels = tileCtx.getImageData(0, 0, tileW, tileH).data;
+            for (let row = 0; row < tileH; row += 1) {
+              const src = row * tileW * 4;
+              const dst = ((ty + row) * width + tx) * 4;
+              imageData.set(tilePixels.subarray(src, src + tileW * 4), dst);
+            }
+          }
+        }
+        return { bitmap, width, height, imageData };
+      }
+
+      document.getElementById('loadImageBtn').addEventListener('click', () => {
+        const fileInput = document.createElement('input');
+        fileInput.type = 'file';
+        fileInput.accept = 'image/*';
+        fileInput.addEventListener('change', async (event) => {
+          const file = event.target.files[0];
+          if (!file) return;
+          statusLabel.textContent = 'Loading image…';
+          try {
+            const { bitmap, width, height, imageData } = await loadImageFromFile(file);
+            mapWidth = width;
+            mapHeight = height;
+            const { regionMask, gridCols, gridRows } = assignRegionsByGrid(width, height, nRegions);
+            mapState = { imageData, regionMask, bitmap };
+            dataset = createDataset(...Object.values(
+              generateGridTrainingPatches(imageData, width, height, gridCols, gridRows, patchSize, 48)
+            ));
+            model = createMapModel(gl, nRegions);
+            trainer = createTrainer(gl, programs, model, {
+              lr: Number(lrInput.value),
+              beta1: 0.9,
+              beta2: 0.999,
+              eps: 1e-8,
+              batchSize: 16,
+              loss: 'crossEntropy',
+            });
+            lossHistory = [];
+            epochLabel.textContent = 'Epoch: 0';
+            statusLabel.textContent = `Image: ${width}×${height}px (${gridCols}×${gridRows} region grid) | Dataset: ${dataset.size} samples.`;
+            predictionLabel.textContent = 'Click the map to test a patch.';
+            renderMap();
+            drawLoss();
+          } catch (error) {
+            statusLabel.textContent = `Error loading image: ${error.message}`;
+          }
+        });
+        fileInput.click();
+      });
+      // -----------------------------------------------
+
       trainBtn.addEventListener('click', train);
       stopBtn.addEventListener('click', () => { stopRequested = true; });
       resetBtn.addEventListener('click', rebuild);

@@ -69,6 +69,70 @@ export function extractPatch(imageData, mapWidth, x, y, patchSize) {
   return patch;
 }
 
+/**
+ * Divide an image into a nRegions-cell grid, choosing the column/row layout
+ * that best matches the image aspect ratio. Returns the region mask and the
+ * grid dimensions so callers can sample patches without a full-image scan.
+ */
+export function assignRegionsByGrid(width, height, nRegions) {
+  let bestCols = 1;
+  let bestScore = Infinity;
+  for (let cols = 1; cols <= nRegions; cols += 1) {
+    if (nRegions % cols !== 0) continue;
+    const rows = nRegions / cols;
+    const score = Math.abs(Math.log((cols / rows) / (width / height)));
+    if (score < bestScore) {
+      bestScore = score;
+      bestCols = cols;
+    }
+  }
+  const gridCols = bestCols;
+  const gridRows = nRegions / gridCols;
+  const regionMask = new Uint8Array(width * height);
+  for (let y = 0; y < height; y += 1) {
+    const row = Math.min(gridRows - 1, Math.floor((y * gridRows) / height));
+    for (let x = 0; x < width; x += 1) {
+      const col = Math.min(gridCols - 1, Math.floor((x * gridCols) / width));
+      regionMask[y * width + x] = row * gridCols + col;
+    }
+  }
+  return { regionMask, gridCols, gridRows };
+}
+
+/**
+ * Fast patch sampling that avoids iterating all pixels: samples directly
+ * from each grid cell's bounding box. Use this when the image is large.
+ */
+export function generateGridTrainingPatches(imageData, width, height, gridCols, gridRows, patchSize, patchesPerRegion) {
+  const inputs = [];
+  const labels = [];
+  const cellW = width / gridCols;
+  const cellH = height / gridRows;
+  const half = Math.floor(patchSize / 2);
+  for (let row = 0; row < gridRows; row += 1) {
+    for (let col = 0; col < gridCols; col += 1) {
+      const region = row * gridCols + col;
+      const xMin = Math.ceil(col * cellW) + half;
+      const xMax = Math.floor((col + 1) * cellW) - half;
+      const yMin = Math.ceil(row * cellH) + half;
+      const yMax = Math.floor((row + 1) * cellH) - half;
+      if (xMax <= xMin || yMax <= yMin) continue;
+      for (let sample = 0; sample < patchesPerRegion; sample += 1) {
+        const x = xMin + Math.floor(Math.random() * (xMax - xMin));
+        const y = yMin + Math.floor(Math.random() * (yMax - yMin));
+        const patch = extractPatch(imageData, width, x, y, patchSize);
+        const jitter = 1 + (Math.random() * 0.16 - 0.08);
+        for (let index = 0; index < patch.length; index += 1) {
+          patch[index] = Math.max(-1, Math.min(1, patch[index] * jitter + (Math.random() * 0.04 - 0.02)));
+        }
+        inputs.push(patch);
+        labels.push(region);
+      }
+    }
+  }
+  return { inputs, labels };
+}
+
 export function generateTrainingPatches(imageData, regionMask, mapWidth, mapHeight, patchSize, patchesPerRegion) {
   const coordsByRegion = new Map();
   for (let y = 0; y < mapHeight; y += 1) {

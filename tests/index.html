@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WebGL Tests</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 0; padding: 1.5rem; background: #020617; color: #e2e8f0; }
+      li { margin: 0.5rem 0; }
+      .pass { color: #4ade80; }
+      .fail { color: #f87171; }
+      code { color: #93c5fd; }
+    </style>
+  </head>
+  <body>
+    <h1>Browser Test Runner</h1>
+    <p><a href="/">Back</a></p>
+    <ul id="results"></ul>
+    <script type="module">
+      import { createWebGL2Context, createTensor, destroyTensor, readTensor } from '../src/webgl/context.js';
+      import { buildProgramCache } from '../src/webgl/program.js';
+      import { MATMUL_SHADERS, matmul, matmulAt, matmulBt } from '../src/ops/matmul.js';
+      import { ELEMENTWISE_SHADERS, reluFwd, reluBwd, geluFwd } from '../src/ops/elementwise.js';
+      import { REDUCE_SHADERS, softmaxFwd } from '../src/ops/reduce.js';
+      import { NORM_SHADERS, layerNormFwd } from '../src/ops/norm.js';
+      import { ATTENTION_SHADERS, scaledDotProductFwd } from '../src/ops/attention.js';
+      import { createDenseWeights, denseFwd } from '../src/layers/dense.js';
+      import { LOSS_SHADERS, crossEntropyLoss } from '../src/training/loss.js';
+      import { OPTIMIZER_SHADERS, createAdamState, adamStep } from '../src/training/optimizer.js';
+      import { serializeWeights, deserializeWeights } from '../src/utils/serialize.js';
+
+      const results = document.getElementById('results');
+      const gl = createWebGL2Context(document.createElement('canvas'));
+      const programs = buildProgramCache(gl, {
+        ...MATMUL_SHADERS,
+        ...ELEMENTWISE_SHADERS,
+        ...REDUCE_SHADERS,
+        ...NORM_SHADERS,
+        ...ATTENTION_SHADERS,
+        ...LOSS_SHADERS,
+        ...OPTIMIZER_SHADERS,
+      });
+
+      function approx(a, b, eps = 1e-3) {
+        return Math.abs(a - b) <= eps;
+      }
+
+      function assert(condition, message) {
+        if (!condition) throw new Error(message);
+      }
+
+      function assertArrayClose(actual, expected, eps = 1e-3) {
+        assert(actual.length === expected.length, 'Length mismatch');
+        for (let i = 0; i < actual.length; i += 1) {
+          if (!approx(actual[i], expected[i], eps)) {
+            throw new Error(`Mismatch at ${i}: ${actual[i]} vs ${expected[i]}`);
+          }
+        }
+      }
+
+      async function runTest(name, fn) {
+        const start = performance.now();
+        const item = document.createElement('li');
+        try {
+          await fn();
+          item.className = 'pass';
+          item.textContent = `PASS ${name} (${(performance.now() - start).toFixed(2)}ms)`;
+        } catch (error) {
+          item.className = 'fail';
+          item.textContent = `FAIL ${name}: ${error.message}`;
+        }
+        results.appendChild(item);
+      }
+
+      await runTest('testMatmul', () => {
+        const A = createTensor(gl, 2, 3, new Float32Array([1, 2, 3, 4, 5, 6]));
+        const B = createTensor(gl, 3, 2, new Float32Array([7, 8, 9, 10, 11, 12]));
+        const C = matmul(gl, programs, A, B);
+        assertArrayClose(readTensor(gl, C), new Float32Array([58, 64, 139, 154]));
+        [A, B, C].forEach((tensor) => destroyTensor(gl, tensor));
+      });
+
+      await runTest('testMatmulAt', () => {
+        const A = createTensor(gl, 3, 2, new Float32Array([1, 2, 3, 4, 5, 6]));
+        const B = createTensor(gl, 3, 2, new Float32Array([7, 8, 9, 10, 11, 12]));
+        const C = matmulAt(gl, programs, A, B);
+        assertArrayClose(readTensor(gl, C), new Float32Array([89, 98, 116, 128]));
+        [A, B, C].forEach((tensor) => destroyTensor(gl, tensor));
+      });
+
+      await runTest('testMatmulBt', () => {
+        const A = createTensor(gl, 2, 3, new Float32Array([1, 2, 3, 4, 5, 6]));
+        const B = createTensor(gl, 4, 3, new Float32Array([1, 0, 1, 0, 1, 0, 2, 2, 2, 1, 1, 1]));
+        const C = matmulBt(gl, programs, A, B);
+        assertArrayClose(readTensor(gl, C), new Float32Array([4, 2, 12, 6, 10, 5, 30, 15]));
+        [A, B, C].forEach((tensor) => destroyTensor(gl, tensor));
+      });
+
+      await runTest('testRelu', () => {
+        const X = createTensor(gl, 1, 4, new Float32Array([-1, 0.5, -0.2, 2]));
+        const dY = createTensor(gl, 1, 4, new Float32Array([1, 1, 1, 1]));
+        const Y = reluFwd(gl, programs, X);
+        const dX = reluBwd(gl, programs, X, dY);
+        assertArrayClose(readTensor(gl, Y), new Float32Array([0, 0.5, 0, 2]));
+        assertArrayClose(readTensor(gl, dX), new Float32Array([0, 1, 0, 1]));
+        [X, dY, Y, dX].forEach((tensor) => destroyTensor(gl, tensor));
+      });
+
+      await runTest('testGelu', () => {
+        const X = createTensor(gl, 1, 3, new Float32Array([-1, 0, 1]));
+        const Y = geluFwd(gl, programs, X);
+        const actual = readTensor(gl, Y);
+        const geluC = Math.sqrt(2 / Math.PI);
+        const geluA = 0.044715;
+        const cpu = [-1, 0, 1].map((x) => 0.5 * x * (1 + Math.tanh(geluC * (x + geluA * x ** 3))));
+        assertArrayClose(actual, new Float32Array(cpu), 1e-2);
+        [X, Y].forEach((tensor) => destroyTensor(gl, tensor));
+      });
+
+      await runTest('testSoftmax', () => {
+        const X = createTensor(gl, 2, 3, new Float32Array([1, 2, 3, 3, 2, 1]));
+        const Y = softmaxFwd(gl, programs, X);
+        const data = readTensor(gl, Y);
+        for (let row = 0; row < 2; row += 1) {
+          const sum = data.slice(row * 3, row * 3 + 3).reduce((a, b) => a + b, 0);
+          assert(approx(sum, 1, 1e-3), 'Softmax row sum mismatch');
+        }
+        assert(data[2] > data[1] && data[1] > data[0], 'Softmax ordering mismatch');
+        [X, Y].forEach((tensor) => destroyTensor(gl, tensor));
+      });
+
+      await runTest('testLayerNorm', () => {
+        const X = createTensor(gl, 2, 4, new Float32Array([1, 2, 3, 4, 2, 4, 6, 8]));
+        const gamma = createTensor(gl, 1, 4, new Float32Array([1, 1, 1, 1]));
+        const beta = createTensor(gl, 1, 4, new Float32Array([0, 0, 0, 0]));
+        const { output, mean, invStd } = layerNormFwd(gl, programs, X, gamma, beta, 1e-5);
+        const data = readTensor(gl, output);
+        for (let row = 0; row < 2; row += 1) {
+          const rowData = Array.from(data.slice(row * 4, row * 4 + 4));
+          const rowMean = rowData.reduce((a, b) => a + b, 0) / 4;
+          const variance = rowData.reduce((a, b) => a + b * b, 0) / 4;
+          assert(approx(rowMean, 0, 1e-3), 'LayerNorm mean mismatch');
+          assert(approx(variance, 1, 1e-2), 'LayerNorm variance mismatch');
+        }
+        [X, gamma, beta, output, mean, invStd].forEach((tensor) => destroyTensor(gl, tensor));
+      });
+
+      await runTest('testAttention', () => {
+        const Q = createTensor(gl, 2, 2, new Float32Array([1, 0, 0, 1]));
+        const K = createTensor(gl, 2, 2, new Float32Array([1, 0, 0, 1]));
+        const V = createTensor(gl, 2, 2, new Float32Array([1, 2, 3, 4]));
+        const { output, attnWeights } = scaledDotProductFwd(gl, programs, Q, K, V);
+        const attn = readTensor(gl, attnWeights);
+        assert(approx(attn[0] + attn[1], 1, 1e-3), 'Attention row 0 sum mismatch');
+        assert(approx(attn[2] + attn[3], 1, 1e-3), 'Attention row 1 sum mismatch');
+        assert(output.rows === 2 && output.cols === 2, 'Attention output shape mismatch');
+        [Q, K, V, output, attnWeights].forEach((tensor) => destroyTensor(gl, tensor));
+      });
+
+      await runTest('testDenseFwd', () => {
+        const input = createTensor(gl, 2, 2, new Float32Array([1, 2, 3, 4]));
+        const W = createTensor(gl, 2, 2, new Float32Array([1, 0, 0, 1]));
+        const b = createTensor(gl, 1, 2, new Float32Array([1, -1]));
+        const { output, preActivation } = denseFwd(gl, programs, input, { W, b }, 'linear');
+        assertArrayClose(readTensor(gl, output), new Float32Array([2, 1, 4, 3]));
+        [input, W, b, output, preActivation].forEach((tensor) => destroyTensor(gl, tensor));
+      });
+
+      await runTest('testAdam', () => {
+        const param = createTensor(gl, 1, 2, new Float32Array([1, -1]));
+        const grad = createTensor(gl, 1, 2, new Float32Array([0.5, -0.25]));
+        const state = createAdamState(gl, [{ rows: 1, cols: 2 }]);
+        adamStep(gl, programs, [param], [grad], state, { lr: 0.1, beta1: 0.9, beta2: 0.999, eps: 1e-8 });
+        const data = readTensor(gl, param);
+        assert(data[0] < 1 && data[1] > -1, 'Adam update direction mismatch');
+        destroyTensor(gl, param);
+        destroyTensor(gl, grad);
+        state.m.forEach((tensor) => destroyTensor(gl, tensor));
+        state.v.forEach((tensor) => destroyTensor(gl, tensor));
+      });
+
+      await runTest('testCrossEntropy', () => {
+        const logits = createTensor(gl, 1, 2, new Float32Array([0, 0]));
+        const { loss, dLogits } = crossEntropyLoss(gl, programs, logits, new Int32Array([1]));
+        assert(approx(loss, Math.log(2), 1e-3), 'Cross entropy loss mismatch');
+        assertArrayClose(readTensor(gl, dLogits), new Float32Array([0.5, -0.5]));
+        [logits, dLogits].forEach((tensor) => destroyTensor(gl, tensor));
+      });
+
+      await runTest('testSerialize', () => {
+        const tensors = [createTensor(gl, 1, 3, new Float32Array([1, 2, 3]))];
+        const json = serializeWeights(gl, tensors);
+        const parsed = deserializeWeights(json);
+        assert(parsed[0].rows === 1 && parsed[0].cols === 3, 'Deserialize shape mismatch');
+        assertArrayClose(parsed[0].data, new Float32Array([1, 2, 3]));
+        tensors.forEach((tensor) => destroyTensor(gl, tensor));
+      });
+    </script>
+  </body>
+</html>

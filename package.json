@@ -1,0 +1,9 @@
+{
+  "name": "webgl-training",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "start": "bun server.js",
+    "test": "bun test"
+  }
+}

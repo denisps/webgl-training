@@ -61,8 +61,8 @@
       import { ATTENTION_SHADERS } from '../../src/ops/attention.js';
       import { LOSS_SHADERS } from '../../src/training/loss.js';
       import { OPTIMIZER_SHADERS } from '../../src/training/optimizer.js';
-      import { createTrainer, trainEpoch } from '../../src/training/trainer.js';
-      import { createDataset } from '../../src/utils/data.js';
+      import { createTrainer, trainStep } from '../../src/training/trainer.js';
+      import { createDataset, shuffleDataset, getBatch } from '../../src/utils/data.js';
       import { downloadWeights, loadWeightsFromFile } from '../../src/utils/serialize.js';
       import { loadModelWeights } from '../../src/inference/model.js';
       import { runBatchInference } from '../../src/inference/runner.js';
@@ -301,14 +301,31 @@
         stopRequested = false;
         trainer.config.lr = Number(lrInput.value);
         const epochs = Number(epochsInput.value);
+        const yieldEveryMs = 32;
         for (let epoch = 0; epoch < epochs; epoch += 1) {
           if (stopRequested) break;
-          const result = trainEpoch(gl, programs, trainer, dataset, ({ batchIndex, batchCount, loss }) => {
+          const shuffled = shuffleDataset(dataset);
+          const { batchSize } = trainer.config;
+          const batchCount = Math.ceil(shuffled.inputs.length / batchSize);
+          let totalLoss = 0;
+          let lastYield = performance.now();
+          for (let batchIndex = 0; batchIndex < batchCount; batchIndex += 1) {
+            if (stopRequested) break;
+            const batch = getBatch(shuffled, batchIndex, batchSize);
+            const { loss } = trainStep(gl, programs, trainer, batch.inputs, batch.labels);
+            totalLoss += loss;
             statusLabel.textContent = `Epoch ${epoch + 1}/${epochs} batch ${batchIndex + 1}/${batchCount} loss ${loss.toFixed(4)}`;
-          });
-          lossHistory.push(result.avgLoss);
+            const now = performance.now();
+            if (now - lastYield >= yieldEveryMs) {
+              await new Promise((resolve) => setTimeout(resolve, 0));
+              lastYield = performance.now();
+            }
+          }
+          if (stopRequested) break;
+          const avgLoss = totalLoss / Math.max(batchCount, 1);
+          lossHistory.push(avgLoss);
           epochLabel.textContent = `Epoch: ${epoch + 1}`;
-          statusLabel.textContent = `Epoch ${epoch + 1}/${epochs} avg loss ${result.avgLoss.toFixed(4)}`;
+          statusLabel.textContent = `Epoch ${epoch + 1}/${epochs} avg loss ${avgLoss.toFixed(4)}`;
           drawLoss();
           await new Promise((resolve) => requestAnimationFrame(resolve));
         }

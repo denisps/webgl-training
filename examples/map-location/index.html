@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Map Location Example</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 0; background: #0f172a; color: #e2e8f0; }
+      header, main { padding: 1rem 1.25rem; }
+      header { border-bottom: 1px solid #1e293b; }
+      main { display: grid; grid-template-columns: minmax(320px, 1.2fr) minmax(280px, 1fr); gap: 1rem; }
+      section { background: #111827; border: 1px solid #1f2937; border-radius: 0.75rem; padding: 1rem; }
+      .controls { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; margin-bottom: 1rem; }
+      button, input { background: #1e293b; color: #e2e8f0; border: 1px solid #334155; border-radius: 0.5rem; padding: 0.5rem 0.75rem; }
+      button { cursor: pointer; }
+      canvas { max-width: 100%; border-radius: 0.5rem; background: #020617; }
+      .status { color: #94a3b8; font-size: 0.95rem; }
+      .prediction { font-size: 1rem; line-height: 1.6; }
+      label { display: inline-flex; gap: 0.5rem; align-items: center; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Map Location Prediction</h1>
+      <p>Train a dense WebGL model to predict the clicked region from a 32×32 RGB patch.</p>
+      <p><a href="/">Back</a></p>
+    </header>
+    <main>
+      <section>
+        <div class="controls">
+          <button id="trainBtn">Train</button>
+          <button id="stopBtn">Stop</button>
+          <button id="resetBtn">Reset</button>
+          <button id="downloadBtn">Download weights</button>
+          <button id="uploadBtn">Upload weights</button>
+          <label>LR <input id="lrInput" type="range" min="0.0005" max="0.02" step="0.0005" value="0.004" /></label>
+          <label>Epochs <input id="epochsInput" type="number" min="1" max="200" value="20" /></label>
+        </div>
+        <canvas id="mapCanvas" width="256" height="256"></canvas>
+        <p class="status" id="status"></p>
+      </section>
+      <section>
+        <h2>Training</h2>
+        <canvas id="lossCanvas" width="360" height="180"></canvas>
+        <p class="status" id="epochLabel">Epoch: 0</p>
+        <h2>Testing</h2>
+        <canvas id="patchCanvas" width="128" height="128"></canvas>
+        <div class="prediction" id="predictionLabel">Click the map to test a patch.</div>
+      </section>
+    </main>
+    <script type="module">
+      import { createWebGL2Context } from '../../src/webgl/context.js';
+      import { buildProgramCache } from '../../src/webgl/program.js';
+      import { MATMUL_SHADERS } from '../../src/ops/matmul.js';
+      import { ELEMENTWISE_SHADERS } from '../../src/ops/elementwise.js';
+      import { REDUCE_SHADERS } from '../../src/ops/reduce.js';
+      import { NORM_SHADERS } from '../../src/ops/norm.js';
+      import { ATTENTION_SHADERS } from '../../src/ops/attention.js';
+      import { LOSS_SHADERS } from '../../src/training/loss.js';
+      import { OPTIMIZER_SHADERS } from '../../src/training/optimizer.js';
+      import { createTrainer, trainEpoch } from '../../src/training/trainer.js';
+      import { createDataset } from '../../src/utils/data.js';
+      import { downloadWeights, loadWeightsFromFile } from '../../src/utils/serialize.js';
+      import { loadModelWeights } from '../../src/inference/model.js';
+      import { runBatchInference } from '../../src/inference/runner.js';
+      import { generateMap, generateTrainingPatches, extractPatch } from './mapgen.js';
+      import { createMapModel } from './model.js';
+
+      const shaderSources = {
+        ...MATMUL_SHADERS,
+        ...ELEMENTWISE_SHADERS,
+        ...REDUCE_SHADERS,
+        ...NORM_SHADERS,
+        ...ATTENTION_SHADERS,
+        ...LOSS_SHADERS,
+        ...OPTIMIZER_SHADERS,
+      };
+
+      const mapCanvas = document.getElementById('mapCanvas');
+      const patchCanvas = document.getElementById('patchCanvas');
+      const lossCanvas = document.getElementById('lossCanvas');
+      const statusLabel = document.getElementById('status');
+      const epochLabel = document.getElementById('epochLabel');
+      const predictionLabel = document.getElementById('predictionLabel');
+      const trainBtn = document.getElementById('trainBtn');
+      const stopBtn = document.getElementById('stopBtn');
+      const resetBtn = document.getElementById('resetBtn');
+      const downloadBtn = document.getElementById('downloadBtn');
+      const uploadBtn = document.getElementById('uploadBtn');
+      const lrInput = document.getElementById('lrInput');
+      const epochsInput = document.getElementById('epochsInput');
+
+      const gl = createWebGL2Context(document.createElement('canvas'));
+      const programs = buildProgramCache(gl, shaderSources);
+      const patchSize = 32;
+      const nRegions = 8;
+      const mapWidth = 256;
+      const mapHeight = 256;
+      let mapState;
+      let dataset;
+      let model;
+      let trainer;
+      let lossHistory = [];
+      let stopRequested = false;
+
+      function drawLoss() {
+        const ctx = lossCanvas.getContext('2d');
+        ctx.clearRect(0, 0, lossCanvas.width, lossCanvas.height);
+        ctx.fillStyle = '#020617';
+        ctx.fillRect(0, 0, lossCanvas.width, lossCanvas.height);
+        if (lossHistory.length < 2) {
+          return;
+        }
+        const maxLoss = Math.max(...lossHistory);
+        const minLoss = Math.min(...lossHistory);
+        ctx.strokeStyle = '#38bdf8';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        lossHistory.forEach((loss, index) => {
+          const x = (index / Math.max(lossHistory.length - 1, 1)) * lossCanvas.width;
+          const y = lossCanvas.height - ((loss - minLoss) / Math.max(maxLoss - minLoss, 1e-6)) * (lossCanvas.height - 12) - 6;
+          if (index === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+      }
+
+      function renderMap() {
+        const ctx = mapCanvas.getContext('2d');
+        const imageData = new ImageData(mapState.imageData, mapWidth, mapHeight);
+        ctx.putImageData(imageData, 0, 0);
+      }
+
+      function renderPatch(patch) {
+        const ctx = patchCanvas.getContext('2d');
+        const image = ctx.createImageData(patchSize, patchSize);
+        for (let index = 0; index < patchSize * patchSize; index += 1) {
+          image.data[index * 4 + 0] = Math.max(0, Math.min(255, (patch[index * 3 + 0] + 1) * 127.5));
+          image.data[index * 4 + 1] = Math.max(0, Math.min(255, (patch[index * 3 + 1] + 1) * 127.5));
+          image.data[index * 4 + 2] = Math.max(0, Math.min(255, (patch[index * 3 + 2] + 1) * 127.5));
+          image.data[index * 4 + 3] = 255;
+        }
+        const temp = document.createElement('canvas');
+        temp.width = patchSize;
+        temp.height = patchSize;
+        temp.getContext('2d').putImageData(image, 0, 0);
+        ctx.imageSmoothingEnabled = false;
+        ctx.clearRect(0, 0, patchCanvas.width, patchCanvas.height);
+        ctx.drawImage(temp, 0, 0, patchCanvas.width, patchCanvas.height);
+      }
+
+      function rebuild() {
+        mapState = generateMap(mapWidth, mapHeight, nRegions);
+        dataset = createDataset(...Object.values(generateTrainingPatches(mapState.imageData, mapState.regionMask, mapWidth, mapHeight, patchSize, 48)));
+        model = createMapModel(gl, nRegions);
+        trainer = createTrainer(gl, programs, model, {
+          lr: Number(lrInput.value),
+          beta1: 0.9,
+          beta2: 0.999,
+          eps: 1e-8,
+          batchSize: 16,
+          loss: 'crossEntropy',
+        });
+        lossHistory = [];
+        epochLabel.textContent = 'Epoch: 0';
+        statusLabel.textContent = `Dataset: ${dataset.size} samples across ${nRegions} regions.`;
+        predictionLabel.textContent = 'Click the map to test a patch.';
+        renderMap();
+        drawLoss();
+      }
+
+      async function train() {
+        stopRequested = false;
+        trainer.config.lr = Number(lrInput.value);
+        const epochs = Number(epochsInput.value);
+        for (let epoch = 0; epoch < epochs; epoch += 1) {
+          if (stopRequested) break;
+          const result = trainEpoch(gl, programs, trainer, dataset, ({ batchIndex, batchCount, loss }) => {
+            statusLabel.textContent = `Epoch ${epoch + 1}/${epochs} batch ${batchIndex + 1}/${batchCount} loss ${loss.toFixed(4)}`;
+          });
+          lossHistory.push(result.avgLoss);
+          epochLabel.textContent = `Epoch: ${epoch + 1}`;
+          statusLabel.textContent = `Epoch ${epoch + 1}/${epochs} avg loss ${result.avgLoss.toFixed(4)}`;
+          drawLoss();
+          await new Promise((resolve) => requestAnimationFrame(resolve));
+        }
+      }
+
+      async function predictAt(x, y) {
+        const patch = extractPatch(mapState.imageData, mapWidth, x, y, patchSize);
+        renderPatch(patch);
+        const logits = runBatchInference(gl, programs, model, patch);
+        let bestIndex = 0;
+        let bestValue = logits[0];
+        for (let index = 1; index < logits.length; index += 1) {
+          if (logits[index] > bestValue) {
+            bestValue = logits[index];
+            bestIndex = index;
+          }
+        }
+        const truth = mapState.regionMask[y * mapWidth + x];
+        predictionLabel.textContent = `Prediction: region ${bestIndex} | ground truth: region ${truth}`;
+      }
+
+      mapCanvas.addEventListener('click', (event) => {
+        const rect = mapCanvas.getBoundingClientRect();
+        const x = Math.max(0, Math.min(mapWidth - 1, Math.floor((event.clientX - rect.left) * mapWidth / rect.width)));
+        const y = Math.max(0, Math.min(mapHeight - 1, Math.floor((event.clientY - rect.top) * mapHeight / rect.height)));
+        predictAt(x, y);
+      });
+      trainBtn.addEventListener('click', train);
+      stopBtn.addEventListener('click', () => { stopRequested = true; });
+      resetBtn.addEventListener('click', rebuild);
+      downloadBtn.addEventListener('click', () => downloadWeights(gl, model.parameters, 'map-location-weights.json'));
+      uploadBtn.addEventListener('click', async () => {
+        const parsed = await loadWeightsFromFile();
+        if (parsed) {
+          loadModelWeights(gl, model, parsed);
+          statusLabel.textContent = 'Weights loaded.';
+        }
+      });
+
+      rebuild();
+      renderPatch(extractPatch(mapState.imageData, mapWidth, mapWidth / 2, mapHeight / 2, patchSize));
+    </script>
+  </body>
+</html>

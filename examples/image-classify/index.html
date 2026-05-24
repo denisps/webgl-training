@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Image Classification Example</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 0; background: #020617; color: #e2e8f0; }
+      main { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; padding: 1.25rem; }
+      section { background: #111827; border: 1px solid #1f2937; border-radius: 0.75rem; padding: 1rem; }
+      .controls { display: flex; flex-wrap: wrap; gap: 0.75rem; margin-bottom: 1rem; }
+      button, input { background: #1e293b; color: #e2e8f0; border: 1px solid #334155; border-radius: 0.5rem; padding: 0.5rem 0.75rem; }
+      canvas { border-radius: 0.5rem; background: #0f172a; image-rendering: pixelated; }
+      a { color: #7dd3fc; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section>
+        <h1>Synthetic Image Classification</h1>
+        <p><a href="/">Back</a></p>
+        <div class="controls">
+          <button id="trainBtn">Train</button>
+          <button id="stopBtn">Stop</button>
+          <button id="resetBtn">Reset</button>
+          <button id="sampleBtn">Random sample</button>
+          <label>LR <input id="lrInput" type="range" min="0.0005" max="0.02" step="0.0005" value="0.003" /></label>
+          <label>Epochs <input id="epochsInput" type="number" min="1" max="100" value="15" /></label>
+        </div>
+        <canvas id="sampleCanvas" width="280" height="280"></canvas>
+        <p id="sampleLabel">Training sample preview.</p>
+      </section>
+      <section>
+        <h2>Training</h2>
+        <canvas id="lossCanvas" width="360" height="180"></canvas>
+        <p id="status">Ready.</p>
+        <p id="prediction">Prediction: -</p>
+      </section>
+    </main>
+    <script type="module">
+      import { createWebGL2Context } from '../../src/webgl/context.js';
+      import { buildProgramCache } from '../../src/webgl/program.js';
+      import { MATMUL_SHADERS } from '../../src/ops/matmul.js';
+      import { ELEMENTWISE_SHADERS } from '../../src/ops/elementwise.js';
+      import { REDUCE_SHADERS } from '../../src/ops/reduce.js';
+      import { NORM_SHADERS } from '../../src/ops/norm.js';
+      import { ATTENTION_SHADERS } from '../../src/ops/attention.js';
+      import { LOSS_SHADERS } from '../../src/training/loss.js';
+      import { OPTIMIZER_SHADERS } from '../../src/training/optimizer.js';
+      import { createTrainer, trainEpoch } from '../../src/training/trainer.js';
+      import { createDataset } from '../../src/utils/data.js';
+      import { runBatchInference } from '../../src/inference/runner.js';
+      import { generatePatternDataset } from './data.js';
+      import { createClassifierModel } from './model.js';
+
+      const gl = createWebGL2Context(document.createElement('canvas'));
+      const programs = buildProgramCache(gl, {
+        ...MATMUL_SHADERS,
+        ...ELEMENTWISE_SHADERS,
+        ...REDUCE_SHADERS,
+        ...NORM_SHADERS,
+        ...ATTENTION_SHADERS,
+        ...LOSS_SHADERS,
+        ...OPTIMIZER_SHADERS,
+      });
+      const nClasses = 6;
+      let dataset;
+      let model;
+      let trainer;
+      let stopRequested = false;
+      let lossHistory = [];
+
+      const sampleCanvas = document.getElementById('sampleCanvas');
+      const lossCanvas = document.getElementById('lossCanvas');
+      const statusLabel = document.getElementById('status');
+      const sampleLabel = document.getElementById('sampleLabel');
+      const predictionLabel = document.getElementById('prediction');
+      const lrInput = document.getElementById('lrInput');
+      const epochsInput = document.getElementById('epochsInput');
+
+      function drawSample(sample, label) {
+        const ctx = sampleCanvas.getContext('2d');
+        const temp = document.createElement('canvas');
+        temp.width = 28;
+        temp.height = 28;
+        const tempCtx = temp.getContext('2d');
+        const image = tempCtx.createImageData(28, 28);
+        for (let index = 0; index < sample.length; index += 1) {
+          const value = Math.max(0, Math.min(255, (sample[index] + 1) * 127.5));
+          image.data[index * 4 + 0] = value;
+          image.data[index * 4 + 1] = value;
+          image.data[index * 4 + 2] = value;
+          image.data[index * 4 + 3] = 255;
+        }
+        tempCtx.putImageData(image, 0, 0);
+        ctx.clearRect(0, 0, sampleCanvas.width, sampleCanvas.height);
+        ctx.imageSmoothingEnabled = false;
+        ctx.drawImage(temp, 0, 0, sampleCanvas.width, sampleCanvas.height);
+        sampleLabel.textContent = `Ground truth class: ${label}`;
+      }
+
+      function drawLoss() {
+        const ctx = lossCanvas.getContext('2d');
+        ctx.clearRect(0, 0, lossCanvas.width, lossCanvas.height);
+        ctx.fillStyle = '#020617';
+        ctx.fillRect(0, 0, lossCanvas.width, lossCanvas.height);
+        if (lossHistory.length < 2) return;
+        const maxLoss = Math.max(...lossHistory);
+        const minLoss = Math.min(...lossHistory);
+        ctx.strokeStyle = '#22c55e';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        lossHistory.forEach((loss, index) => {
+          const x = index / (lossHistory.length - 1) * lossCanvas.width;
+          const y = lossCanvas.height - ((loss - minLoss) / Math.max(maxLoss - minLoss, 1e-6)) * (lossCanvas.height - 12) - 6;
+          if (index === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+      }
+
+      function samplePrediction() {
+        const index = Math.floor(Math.random() * dataset.inputs.length);
+        const sample = dataset.inputs[index];
+        const label = dataset.labels[index];
+        drawSample(sample, label);
+        const logits = runBatchInference(gl, programs, model, sample);
+        let bestIndex = 0;
+        for (let i = 1; i < logits.length; i += 1) {
+          if (logits[i] > logits[bestIndex]) bestIndex = i;
+        }
+        predictionLabel.textContent = `Prediction: ${bestIndex}`;
+      }
+
+      function rebuild() {
+        const generated = generatePatternDataset(nClasses, 48);
+        dataset = createDataset(generated.inputs, generated.labels);
+        model = createClassifierModel(gl, nClasses);
+        trainer = createTrainer(gl, programs, model, {
+          lr: Number(lrInput.value),
+          beta1: 0.9,
+          beta2: 0.999,
+          eps: 1e-8,
+          batchSize: 16,
+          loss: 'crossEntropy',
+        });
+        lossHistory = [];
+        drawLoss();
+        samplePrediction();
+      }
+
+      async function train() {
+        stopRequested = false;
+        trainer.config.lr = Number(lrInput.value);
+        const epochs = Number(epochsInput.value);
+        for (let epoch = 0; epoch < epochs; epoch += 1) {
+          if (stopRequested) break;
+          const result = trainEpoch(gl, programs, trainer, dataset, ({ batchIndex, batchCount, loss }) => {
+            statusLabel.textContent = `Epoch ${epoch + 1}/${epochs}, batch ${batchIndex + 1}/${batchCount}, loss ${loss.toFixed(4)}`;
+          });
+          lossHistory.push(result.avgLoss);
+          drawLoss();
+          statusLabel.textContent = `Epoch ${epoch + 1}/${epochs}, avg loss ${result.avgLoss.toFixed(4)}`;
+          samplePrediction();
+          await new Promise((resolve) => requestAnimationFrame(resolve));
+        }
+      }
+
+      document.getElementById('trainBtn').addEventListener('click', train);
+      document.getElementById('stopBtn').addEventListener('click', () => { stopRequested = true; });
+      document.getElementById('resetBtn').addEventListener('click', rebuild);
+      document.getElementById('sampleBtn').addEventListener('click', samplePrediction);
+      rebuild();
+    </script>
+  </body>
+</html>

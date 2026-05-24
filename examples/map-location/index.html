@@ -35,7 +35,7 @@
           <button id="loadImageBtn">Load map image</button>
           <button id="downloadBtn">Download weights</button>
           <button id="uploadBtn">Upload weights</button>
-          <label>Regions <input id="regionsInput" type="number" min="2" max="16" value="8" /></label>
+          <label>Regions <input id="regionsInput" type="number" min="2" max="512" value="8" /></label>
           <label>LR <input id="lrInput" type="range" min="0.0005" max="0.02" step="0.0005" value="0.004" /></label>
           <label>Epochs <input id="epochsInput" type="number" min="1" max="200" value="20" /></label>
         </div>
@@ -252,7 +252,7 @@
           beta1: 0.9,
           beta2: 0.999,
           eps: 1e-8,
-          batchSize: 16,
+          batchSize: 256,
           loss: 'crossEntropy',
         });
       }
@@ -301,7 +301,7 @@
         stopRequested = false;
         trainer.config.lr = Number(lrInput.value);
         const epochs = Number(epochsInput.value);
-        const yieldEveryMs = 32;
+        const yieldEveryMs = 100;
         for (let epoch = 0; epoch < epochs; epoch += 1) {
           if (stopRequested) break;
           const shuffled = shuffleDataset(dataset);
@@ -309,14 +309,16 @@
           const batchCount = Math.ceil(shuffled.inputs.length / batchSize);
           let totalLoss = 0;
           let lastYield = performance.now();
+          let lastBatchLoss = 0;
           for (let batchIndex = 0; batchIndex < batchCount; batchIndex += 1) {
             if (stopRequested) break;
             const batch = getBatch(shuffled, batchIndex, batchSize);
             const { loss } = trainStep(gl, programs, trainer, batch.inputs, batch.labels);
             totalLoss += loss;
-            statusLabel.textContent = `Epoch ${epoch + 1}/${epochs} batch ${batchIndex + 1}/${batchCount} loss ${loss.toFixed(4)}`;
+            lastBatchLoss = loss;
             const now = performance.now();
             if (now - lastYield >= yieldEveryMs) {
+              statusLabel.textContent = `Epoch ${epoch + 1}/${epochs} batch ${batchIndex + 1}/${batchCount} loss ${lastBatchLoss.toFixed(4)}`;
               await new Promise((resolve) => setTimeout(resolve, 0));
               lastYield = performance.now();
             }

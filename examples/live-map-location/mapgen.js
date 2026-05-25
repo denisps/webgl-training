@@ -1,18 +1,17 @@
-// Normalization divisor for the visible-latitude-extent scale label.
-// log2(visibleLatDeg) / LOG2_SCALE_NORM ≈ [-1, 1] for extents 2^-5 … 2^5 degrees.
-export const LOG2_SCALE_NORM = 5;
-
 // Training scale factor range in log2 space (scaleFactor = source pixels per patch pixel).
-// Range [2^-1, 2^3] = [0.5, 8] covers fine-detail views through full-frame camera crops.
+// Range [2^-1, 2^2] = [0.5, 4] covers fine-detail through wider context crops.
 export const TRAIN_LOG2_SCALE_MIN = -1;
-export const TRAIN_LOG2_SCALE_MAX = 3;
+export const TRAIN_LOG2_SCALE_MAX = 2;
 
-export function encodeVisibleExtent(visibleLatDeg) {
-  return Math.log2(Math.max(1e-9, visibleLatDeg)) / LOG2_SCALE_NORM;
+// Encode scaleFactor → [0, 1] within the training range.
+export function encodeScaleNorm(scaleFactor) {
+  const log2Scale = Math.log2(Math.max(1e-9, scaleFactor));
+  return (log2Scale - TRAIN_LOG2_SCALE_MIN) / (TRAIN_LOG2_SCALE_MAX - TRAIN_LOG2_SCALE_MIN);
 }
 
-export function decodeVisibleExtent(logScaleNorm) {
-  return Math.pow(2, logScaleNorm * LOG2_SCALE_NORM);
+// Decode [0, 1] scale label back to scaleFactor.
+export function decodeScaleNorm(scaleNorm) {
+  return Math.pow(2, scaleNorm * (TRAIN_LOG2_SCALE_MAX - TRAIN_LOG2_SCALE_MIN) + TRAIN_LOG2_SCALE_MIN);
 }
 
 /**
@@ -59,43 +58,45 @@ export function extractTransformedPatch(source, cx, cy, scaleFactor, rotationRad
  * @param {{ latMin, latMax, lonMin, lonMax }} bounds
  * @param {number} scaleFactor - source pixels per patch pixel
  * @param {number} patchSize - patch side length
- * @returns {Float32Array} [latNorm, lonNorm, logScaleNorm]
+ * @returns {Float32Array} [latNorm, lonNorm, scaleNorm] all in [0, 1] relative to map bounds / training range
  */
 export function computePatchLabel(cx, cy, mapWidth, mapHeight, bounds, scaleFactor, patchSize) {
   const { latMin, latMax, lonMin, lonMax } = bounds;
-  const lat = latMin + (cy / mapHeight) * (latMax - latMin);
+  // y=0 is the top of a north-up image (latMax); y=mapHeight is the bottom (latMin).
+  const lat = latMax - (cy / mapHeight) * (latMax - latMin);
   const lon = lonMin + (cx / mapWidth)  * (lonMax - lonMin);
-  const latNorm = lat / 90;
-  const lonNorm = lon / 180;
-  const latPerPixel = (latMax - latMin) / mapHeight;
-  const visibleLatDeg = patchSize * scaleFactor * latPerPixel;
-  const logScaleNorm = encodeVisibleExtent(visibleLatDeg);
-  return new Float32Array([latNorm, lonNorm, logScaleNorm]);
+  // Normalize to [0, 1] within the map bounds for maximum precision on close-range maps.
+  const latNorm = (lat - latMin) / (latMax - latMin);
+  const lonNorm = (lon - lonMin) / (lonMax - lonMin);
+  const scaleNorm = encodeScaleNorm(scaleFactor);
+  return new Float32Array([latNorm, lonNorm, scaleNorm]);
 }
 
 /**
- * Decode model output [latNorm, lonNorm, logScaleNorm] back to geographic values.
+ * Decode model output [latNorm, lonNorm, scaleNorm] back to geographic values.
+ * All three values are in [0, 1] relative to the map's bounds / training scale range.
  * @param {Float32Array|number[]} output
- * @returns {{ lat: number, lon: number, visibleLatDeg: number }}
+ * @param {{ latMin, latMax, lonMin, lonMax }} bounds - the map's geographic bounds
+ * @returns {{ lat: number, lon: number, scaleFactor: number }}
  */
-export function decodePrediction(output) {
-  const [latNorm, lonNorm, logScaleNorm] = output;
+export function decodePrediction(output, bounds) {
+  const [latNorm, lonNorm, scaleNorm] = output;
   return {
-    lat: latNorm * 90,
-    lon: lonNorm * 180,
-    visibleLatDeg: decodeVisibleExtent(logScaleNorm),
+    lat:         bounds.latMin + latNorm * (bounds.latMax - bounds.latMin),
+    lon:         bounds.lonMin + lonNorm * (bounds.lonMax - bounds.lonMin),
+    scaleFactor: decodeScaleNorm(scaleNorm),
   };
 }
 
 /**
  * Convert a (lat, lon) coordinate to pixel position on a canvas of the given size,
- * given the map's geographic bounds.
+ * given the map's geographic bounds. Assumes north-up orientation (y=0 is latMax).
  */
 export function latLonToPixel(lat, lon, bounds, canvasWidth, canvasHeight) {
   const { latMin, latMax, lonMin, lonMax } = bounds;
   return {
     x: (lon - lonMin) / (lonMax - lonMin) * canvasWidth,
-    y: (lat - latMin) / (latMax - latMin) * canvasHeight,
+    y: (1 - (lat - latMin) / (latMax - latMin)) * canvasHeight,
   };
 }
 

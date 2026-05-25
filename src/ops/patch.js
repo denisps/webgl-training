@@ -84,6 +84,39 @@ void main() {
   int b = rowIdx / u_SeqLen;
   outColor = texelFetch(u_dOut, ivec2(col, b), 0).r / float(u_SeqLen);
 }`,
+
+  // Add tiled positional embedding: output[i,j] = X[i,j] + pos[i % seqLen, j].
+  // X: [batch*seqLen, dModel], pos: [seqLen, dModel] -> [batch*seqLen, dModel].
+  addPosEmbed: `${HEADER}
+uniform sampler2D u_Pos;
+uniform int u_SeqLen;
+void main() {
+  int col = int(gl_FragCoord.x);
+  int row = int(gl_FragCoord.y);
+  int posRow = row % u_SeqLen;
+  outColor = texelFetch(u_X, ivec2(col, row), 0).r
+           + texelFetch(u_Pos, ivec2(col, posRow), 0).r;
+}`,
+
+  // Backward of positional embedding: sum gradient rows over the batch dimension.
+  // dOut: [batch*seqLen, dModel], output: [seqLen, dModel] (accumulated pos gradient).
+  posEmbGrad: `#version 300 es
+precision highp float;
+precision highp int;
+precision highp sampler2D;
+out float outColor;
+uniform sampler2D u_dOut;
+uniform int u_SeqLen;
+uniform int u_TotalRows;
+void main() {
+  int col    = int(gl_FragCoord.x);
+  int posRow = int(gl_FragCoord.y);
+  float sum = 0.0;
+  for (int i = posRow; i < u_TotalRows; i += u_SeqLen) {
+    sum += texelFetch(u_dOut, ivec2(col, i), 0).r;
+  }
+  outColor = sum;
+}`,
 };
 
 export function patchify(gl, programs, input, seqLen, gridCols, patchSide, imageWidth, channels) {
@@ -131,4 +164,29 @@ export function meanPoolBwd(gl, programs, dOut, totalRows, seqLen) {
     u_SeqLen: seqLen,
   }, output, programs.__quadBuffer);
   return output;
+}
+
+// Add learnable positional embedding to token sequence.
+// input: [batch*seqLen, dModel], posEmb: [seqLen, dModel] -> [batch*seqLen, dModel]
+export function addPosEmbed(gl, programs, input, posEmb, seqLen) {
+  const output = createTensor(gl, input.rows, input.cols);
+  executePass(gl, programs.addPosEmbed, {
+    u_X:      input.texture,
+    u_Pos:    posEmb.texture,
+    u_SeqLen: seqLen,
+  }, output, programs.__quadBuffer);
+  return output;
+}
+
+// Backward for positional embedding weights: accumulate gradients from all batch positions.
+// dOutput: [batch*seqLen, dModel] -> dPos: [seqLen, dModel]
+// The gradient w.r.t. the input (x) is just dOutput itself (pass-through for addition).
+export function posEmbGrad(gl, programs, dOutput, seqLen) {
+  const dPos = createTensor(gl, seqLen, dOutput.cols);
+  executePass(gl, programs.posEmbGrad, {
+    u_dOut:      dOutput.texture,
+    u_SeqLen:    seqLen,
+    u_TotalRows: dOutput.rows,
+  }, dPos, programs.__quadBuffer);
+  return dPos;
 }

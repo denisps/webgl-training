@@ -218,15 +218,11 @@
         mapCanvas.getContext('2d').drawImage(mapBitmap, 0, 0);
       }
 
-      function drawCrosshairs(ctx, x, y, visibleLatDeg) {
-        const bounds = readBounds();
-        // Arm length: 20px or proportional, whichever is larger
-        const armLen = Math.max(20, (visibleLatDeg / (bounds.latMax - bounds.latMin)) * mapCanvas.height * 0.15);
-        const boxHalfH = (visibleLatDeg / (bounds.latMax - bounds.latMin)) * mapCanvas.height / 2;
-        const latPerPixel = (bounds.latMax - bounds.latMin) / mapBitmap.height;
-        const lonPerPixel = (bounds.lonMax - bounds.lonMin) / mapBitmap.width;
-        const visibleLonDeg = visibleLatDeg * (lonPerPixel / latPerPixel);  // aspect-correct
-        const boxHalfW = (visibleLonDeg / (bounds.lonMax - bounds.lonMin)) * mapCanvas.width / 2;
+      function drawCrosshairs(ctx, x, y, scaleFactor) {
+        // Box represents the visible area of the patch on the map canvas.
+        // Since mapCanvas dimensions equal mapBitmap dimensions, boxHalf = REGION_SIZE * scaleFactor / 2.
+        const boxHalf = REGION_SIZE * scaleFactor / 2;
+        const armLen  = Math.max(20, REGION_SIZE * scaleFactor * 0.15);
 
         ctx.save();
         ctx.shadowColor = '#000';
@@ -236,7 +232,7 @@
         ctx.strokeStyle = 'rgba(251, 191, 36, 0.6)';
         ctx.lineWidth = 1.5;
         ctx.setLineDash([4, 3]);
-        ctx.strokeRect(x - boxHalfW, y - boxHalfH, boxHalfW * 2, boxHalfH * 2);
+        ctx.strokeRect(x - boxHalf, y - boxHalf, boxHalf * 2, boxHalf * 2);
         ctx.setLineDash([]);
 
         // Crosshair lines
@@ -255,13 +251,13 @@
         ctx.restore();
       }
 
-      function renderMapWithPrediction(lat, lon, visibleLatDeg) {
+      function renderMapWithPrediction(lat, lon, scaleFactor) {
         if (!mapBitmap) return;
         renderMapBase();
         const bounds = readBounds();
         if (!boundsValid(bounds)) return;
         const px = latLonToPixel(lat, lon, bounds, mapCanvas.width, mapCanvas.height);
-        drawCrosshairs(mapCanvas.getContext('2d'), px.x, px.y, visibleLatDeg);
+        drawCrosshairs(mapCanvas.getContext('2d'), px.x, px.y, scaleFactor);
       }
 
       // ── Patch preview ──────────────────────────────────────────────────────
@@ -306,13 +302,14 @@
         renderPatch(patch);
 
         const output = runBatchInference(gl, programs, model, patch);
-        const { lat, lon, visibleLatDeg } = decodePrediction(output);
+        const bounds = readBounds();
+        const { lat, lon, scaleFactor: predScale } = decodePrediction(output, bounds);
 
-        renderMapWithPrediction(lat, lon, visibleLatDeg);
+        renderMapWithPrediction(lat, lon, predScale);
 
         predStat.innerHTML =
           `<b>${lat.toFixed(5)}°</b> N &nbsp; <b>${lon.toFixed(5)}°</b> E<br>` +
-          `Scale: <b>${visibleLatDeg.toFixed(4)}°</b> lat visible`;
+          `Scale factor: <b>${predScale.toFixed(2)}×</b>`;
         inferStatus.textContent = `Running – heading ${compassHeading.toFixed(0)}°`;
       }
 

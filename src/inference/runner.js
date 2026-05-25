@@ -33,6 +33,13 @@ export function runInference(gl, programs, model, input) {
     return current;
   }
 
+  // Generic fallback: models that expose a forward function and disposeCache.
+  if (typeof model.forward === 'function') {
+    const { output, cache } = model.forward(gl, programs, input, model.weights);
+    model.disposeCache(gl, cache);
+    return output;
+  }
+
   throw new Error(`Unsupported model type: ${model.type}`);
 }
 

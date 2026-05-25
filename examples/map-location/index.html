@@ -59,8 +59,10 @@
       import { REDUCE_SHADERS } from '../../src/ops/reduce.js';
       import { NORM_SHADERS } from '../../src/ops/norm.js';
       import { ATTENTION_SHADERS } from '../../src/ops/attention.js';
+      import { PATCH_SHADERS } from '../../src/ops/patch.js';
       import { LOSS_SHADERS } from '../../src/training/loss.js';
       import { OPTIMIZER_SHADERS } from '../../src/training/optimizer.js';
+      import { TRANSFORMER_SHADERS } from '../../src/layers/transformer.js';
       import { createTrainer, trainStep } from '../../src/training/trainer.js';
       import { createDataset, shuffleDataset, getBatch } from '../../src/utils/data.js';
       import { downloadWeights, loadWeightsFromFile } from '../../src/utils/serialize.js';
@@ -75,6 +77,8 @@
         ...REDUCE_SHADERS,
         ...NORM_SHADERS,
         ...ATTENTION_SHADERS,
+        ...PATCH_SHADERS,
+        ...TRANSFORMER_SHADERS,
         ...LOSS_SHADERS,
         ...OPTIMIZER_SHADERS,
       };

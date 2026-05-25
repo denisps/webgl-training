@@ -1,72 +1,101 @@
 import { destroyTensor } from '../../src/webgl/context.js';
 import { denseBwd, denseFwd, createDenseWeights } from '../../src/layers/dense.js';
+import { createTransformerWeights, batchedTransformerFwd, batchedTransformerBwd, destroyTransformerCache } from '../../src/layers/transformer.js';
+import { patchify, unpatchify, meanPool, meanPoolBwd } from '../../src/ops/patch.js';
+
+// ViT-style architecture: split each 32×32×3 patch into 4×4=16 spatial tokens
+// of 8×8×3=192 features each, project to dModel, run a transformer block, then
+// average-pool the tokens before the classification head.
+const PATCH_SIDE = 8;
+const IMAGE_SIDE = 32;
+const CHANNELS = 3;
+const SEQ_LEN = (IMAGE_SIDE / PATCH_SIDE) ** 2;   // 16 tokens
+const GRID_COLS = IMAGE_SIDE / PATCH_SIDE;          // 4
+const TOKEN_DIM = PATCH_SIDE * PATCH_SIDE * CHANNELS; // 192
+const D_MODEL = 128;
+const N_HEADS = 4;
+const FFN_DIM = 256;
 
 function flattenWeights(weights) {
   return [
-    weights.l1.W, weights.l1.b,
-    weights.l2.W, weights.l2.b,
-    weights.l3.W, weights.l3.b,
+    weights.embed.W, weights.embed.b,
+    weights.tx.Wq, weights.tx.Wk, weights.tx.Wv, weights.tx.Wo,
+    weights.tx.W1, weights.tx.b1, weights.tx.W2, weights.tx.b2,
+    weights.tx.gamma1, weights.tx.beta1, weights.tx.gamma2, weights.tx.beta2,
+    weights.head.W, weights.head.b,
   ];
 }
 
 export function mapModelFwd(gl, programs, input, weights) {
-  const l1 = denseFwd(gl, programs, input, weights.l1, 'relu');
-  const l2 = denseFwd(gl, programs, l1.output, weights.l2, 'relu');
-  const l3 = denseFwd(gl, programs, l2.output, weights.l3, 'linear');
+  // 1. Split each sample into spatial tokens: [batch, 3072] -> [batch*16, 192]
+  const patched = patchify(gl, programs, input, SEQ_LEN, GRID_COLS, PATCH_SIDE, IMAGE_SIDE, CHANNELS);
+  // 2. Shared linear projection for all tokens: -> [batch*16, 128]
+  const embedded = denseFwd(gl, programs, patched, weights.embed, 'linear');
+  // 3. Transformer block with per-sample block-diagonal attention: -> [batch*16, 128]
+  const txOut = batchedTransformerFwd(gl, programs, embedded.output, weights.tx, SEQ_LEN, N_HEADS);
+  // 4. Average-pool the 16 token representations per sample: -> [batch, 128]
+  const pooled = meanPool(gl, programs, txOut.output, input.rows, SEQ_LEN);
+  // 5. Classification head: -> [batch, nRegions]
+  const logits = denseFwd(gl, programs, pooled, weights.head, 'linear');
   return {
-    output: l3.output,
-    cache: { l1, l2, l3 },
+    output: logits.output,
+    cache: { patched, embedded, txOut, pooled, logits },
   };
 }
 
 export function mapModelBwd(gl, programs, input, weights, cache, dOutput) {
-  const g3 = denseBwd(gl, programs, cache.l2.output, weights.l3, cache.l3.preActivation, dOutput, 'linear');
-  const g2 = denseBwd(gl, programs, cache.l1.output, weights.l2, cache.l2.preActivation, g3.dInput, 'relu');
-  const g1 = denseBwd(gl, programs, input, weights.l1, cache.l1.preActivation, g2.dInput, 'relu');
-  destroyTensor(gl, g3.dInput);
-  destroyTensor(gl, g2.dInput);
+  const gHead = denseBwd(gl, programs, cache.pooled, weights.head, cache.logits.preActivation, dOutput, 'linear');
+  const dTxOut = meanPoolBwd(gl, programs, gHead.dInput, cache.txOut.output.rows, SEQ_LEN);
+  destroyTensor(gl, gHead.dInput);
+  const gTx = batchedTransformerBwd(gl, programs, cache.embedded.output, weights.tx, cache.txOut.cache, dTxOut, SEQ_LEN, N_HEADS);
+  destroyTensor(gl, dTxOut);
+  const gEmbed = denseBwd(gl, programs, cache.patched, weights.embed, cache.embedded.preActivation, gTx.dInput, 'linear');
+  destroyTensor(gl, gTx.dInput);
+  const dInput = unpatchify(gl, programs, gEmbed.dInput, SEQ_LEN, GRID_COLS, PATCH_SIDE, IMAGE_SIDE, CHANNELS);
+  destroyTensor(gl, gEmbed.dInput);
   return {
-    dInput: g1.dInput,
-    gradients: [g1.dW, g1.db, g2.dW, g2.db, g3.dW, g3.db],
+    dInput,
+    gradients: [
+      gEmbed.dW, gEmbed.db,
+      gTx.dWeights.Wq, gTx.dWeights.Wk, gTx.dWeights.Wv, gTx.dWeights.Wo,
+      gTx.dWeights.W1, gTx.dWeights.b1, gTx.dWeights.W2, gTx.dWeights.b2,
+      gTx.dWeights.gamma1, gTx.dWeights.beta1, gTx.dWeights.gamma2, gTx.dWeights.beta2,
+      gHead.dW, gHead.db,
+    ],
   };
 }
 
 export function createMapModel(gl, nRegions = 8) {
   const weights = {
-    l1: createDenseWeights(gl, 32 * 32 * 3, 512),
-    l2: createDenseWeights(gl, 512, 128),
-    l3: createDenseWeights(gl, 128, nRegions),
+    embed: createDenseWeights(gl, TOKEN_DIM, D_MODEL),
+    tx: createTransformerWeights(gl, D_MODEL, N_HEADS, FFN_DIM),
+    head: createDenseWeights(gl, D_MODEL, nRegions),
   };
-  const layers = [
-    { ...weights.l1, activation: 'relu' },
-    { ...weights.l2, activation: 'relu' },
-    { ...weights.l3, activation: 'linear' },
-  ];
   return {
-    type: 'dense',
-    inputSize: 32 * 32 * 3,
-    layers,
+    type: 'patch-transformer',
+    inputSize: IMAGE_SIDE * IMAGE_SIDE * CHANNELS,
     weights,
     parameters: flattenWeights(weights),
     architecture: {
-      type: 'dense',
+      type: 'patch-transformer',
       nRegions,
-      layers: [
-        { inFeatures: 32 * 32 * 3, outFeatures: 512, activation: 'relu' },
-        { inFeatures: 512, outFeatures: 128, activation: 'relu' },
-        { inFeatures: 128, outFeatures: nRegions, activation: 'linear' },
-      ],
+      patchSide: PATCH_SIDE,
+      seqLen: SEQ_LEN,
+      dModel: D_MODEL,
+      nHeads: N_HEADS,
+      ffnDim: FFN_DIM,
     },
     forward: mapModelFwd,
     backward: mapModelBwd,
     disposeCache(glContext, cache) {
-      [
-        cache.l1.output,
-        cache.l1.preActivation,
-        cache.l2.output,
-        cache.l2.preActivation,
-        cache.l3.preActivation,
-      ].forEach((tensor) => destroyTensor(glContext, tensor));
+      destroyTensor(glContext, cache.patched);
+      destroyTensor(glContext, cache.embedded.output);
+      destroyTensor(glContext, cache.embedded.preActivation);
+      destroyTensor(glContext, cache.txOut.output);
+      destroyTransformerCache(glContext, cache.txOut.cache);
+      destroyTensor(glContext, cache.pooled);
+      destroyTensor(glContext, cache.logits.preActivation);
+      // logits.output is the model output tensor, destroyed by trainStep
     },
   };
 }

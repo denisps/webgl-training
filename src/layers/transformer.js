@@ -3,7 +3,7 @@ import { executePass } from '../webgl/program.js';
 import { matmul, matmulAt, matmulBt } from '../ops/matmul.js';
 import { add, scale } from '../ops/elementwise.js';
 import { layerNormBwd, layerNormFwd } from '../ops/norm.js';
-import { scaledDotProductBwd, scaledDotProductFwd } from '../ops/attention.js';
+import { scaledDotProductBwd, scaledDotProductFwd, batchedScaledDotProductFwd, batchedScaledDotProductBwd } from '../ops/attention.js';
 import { denseBwd, denseFwd } from './dense.js';
 
 export const TRANSFORMER_SHADERS = {
@@ -253,4 +253,118 @@ export function destroyTransformerCache(gl, cache) {
   for (const tensor of tensors) {
     destroyTensor(gl, tensor);
   }
+}
+
+// Same transformer block as transformerFwd/Bwd but attention is computed
+// independently within blocks of seqLen rows, so each sample in the batch
+// has its own private sequence of tokens (no cross-sample attention).
+// input: [batch*seqLen, dModel]
+export function batchedTransformerFwd(gl, programs, input, weights, seqLen, nHeads) {
+  const headDim = input.cols / nHeads;
+  const ln1 = layerNormFwd(gl, programs, input, weights.gamma1, weights.beta1, 1e-5);
+  const Q = matmul(gl, programs, ln1.output, weights.Wq);
+  const K = matmul(gl, programs, ln1.output, weights.Wk);
+  const V = matmul(gl, programs, ln1.output, weights.Wv);
+
+  const heads = [];
+  for (let head = 0; head < nHeads; head += 1) {
+    const start = head * headDim;
+    const q = sliceCols(gl, programs, Q, start, headDim);
+    const k = sliceCols(gl, programs, K, start, headDim);
+    const v = sliceCols(gl, programs, V, start, headDim);
+    const attn = batchedScaledDotProductFwd(gl, programs, q, k, v, seqLen);
+    heads.push({ q, k, v, ...attn });
+  }
+
+  const concatInput = heads.map((head) => head.output);
+  const concat = concatMany(gl, programs, concatInput);
+  const attnProj = matmul(gl, programs, concat, weights.Wo);
+  const res1 = add(gl, programs, input, attnProj);
+
+  const ln2 = layerNormFwd(gl, programs, res1, weights.gamma2, weights.beta2, 1e-5);
+  const ff1 = denseFwd(gl, programs, ln2.output, { W: weights.W1, b: weights.b1 }, 'gelu');
+  const ff2 = denseFwd(gl, programs, ff1.output, { W: weights.W2, b: weights.b2 }, 'linear');
+  const output = add(gl, programs, res1, ff2.output);
+
+  return {
+    output,
+    cache: { ln1, Q, K, V, heads, concat, attnProj, res1, ln2, ff1, ff2 },
+  };
+}
+
+export function batchedTransformerBwd(gl, programs, input, weights, cache, dOutput, seqLen, nHeads) {
+  const dFf2 = scale(gl, programs, dOutput, 1.0);
+  let dRes1 = scale(gl, programs, dOutput, 1.0);
+
+  const ff2Grads = denseBwd(gl, programs, cache.ff1.output, { W: weights.W2, b: weights.b2 }, cache.ff2.preActivation, dFf2, 'linear');
+  destroyTensor(gl, dFf2);
+  const ff1Grads = denseBwd(gl, programs, cache.ln2.output, { W: weights.W1, b: weights.b1 }, cache.ff1.preActivation, ff2Grads.dInput, 'gelu');
+  destroyTensor(gl, ff2Grads.dInput);
+  const ln2Grads = layerNormBwd(gl, programs, cache.res1, weights.gamma2, cache.ln2.mean, cache.ln2.invStd, ff1Grads.dInput);
+  destroyTensor(gl, ff1Grads.dInput);
+  const dRes1Total = add(gl, programs, dRes1, ln2Grads.dX);
+  destroyTensor(gl, dRes1);
+  destroyTensor(gl, ln2Grads.dX);
+  dRes1 = dRes1Total;
+
+  const dAttnProj = scale(gl, programs, dRes1, 1.0);
+  const dConcat = matmulBt(gl, programs, dAttnProj, weights.Wo);
+  const dWo = matmulAt(gl, programs, cache.concat, dAttnProj);
+  destroyTensor(gl, dAttnProj);
+
+  const headDim = input.cols / nHeads;
+  const dQHeads = [];
+  const dKHeads = [];
+  const dVHeads = [];
+  for (let head = 0; head < nHeads; head += 1) {
+    const start = head * headDim;
+    const dHeadOut = sliceCols(gl, programs, dConcat, start, headDim);
+    const headCache = cache.heads[head];
+    const grads = batchedScaledDotProductBwd(gl, programs, headCache.q, headCache.k, headCache.v, headCache.attnWeights, dHeadOut, seqLen);
+    dQHeads.push(grads.dQ);
+    dKHeads.push(grads.dK);
+    dVHeads.push(grads.dV);
+    destroyTensor(gl, dHeadOut);
+  }
+  destroyTensor(gl, dConcat);
+
+  const dQ = concatMany(gl, programs, dQHeads);
+  const dK = concatMany(gl, programs, dKHeads);
+  const dV = concatMany(gl, programs, dVHeads);
+  dQHeads.forEach((t) => destroyTensor(gl, t));
+  dKHeads.forEach((t) => destroyTensor(gl, t));
+  dVHeads.forEach((t) => destroyTensor(gl, t));
+
+  const dWq = matmulAt(gl, programs, cache.ln1.output, dQ);
+  const dWk = matmulAt(gl, programs, cache.ln1.output, dK);
+  const dWv = matmulAt(gl, programs, cache.ln1.output, dV);
+  const dLn1Q = matmulBt(gl, programs, dQ, weights.Wq);
+  const dLn1K = matmulBt(gl, programs, dK, weights.Wk);
+  const dLn1V = matmulBt(gl, programs, dV, weights.Wv);
+  const dLn1Tmp = add(gl, programs, dLn1Q, dLn1K);
+  const dLn1 = add(gl, programs, dLn1Tmp, dLn1V);
+  destroyTensor(gl, dQ);
+  destroyTensor(gl, dK);
+  destroyTensor(gl, dV);
+  destroyTensor(gl, dLn1Q);
+  destroyTensor(gl, dLn1K);
+  destroyTensor(gl, dLn1V);
+  destroyTensor(gl, dLn1Tmp);
+
+  const ln1Grads = layerNormBwd(gl, programs, input, weights.gamma1, cache.ln1.mean, cache.ln1.invStd, dLn1);
+  destroyTensor(gl, dLn1);
+  const dInput = add(gl, programs, dRes1, ln1Grads.dX);
+  destroyTensor(gl, dRes1);
+  destroyTensor(gl, ln1Grads.dX);
+
+  return {
+    dInput,
+    dWeights: {
+      Wq: dWq, Wk: dWk, Wv: dWv, Wo: dWo,
+      W1: ff1Grads.dW, b1: ff1Grads.db,
+      W2: ff2Grads.dW, b2: ff2Grads.db,
+      gamma1: ln1Grads.dGamma, beta1: ln1Grads.dBeta,
+      gamma2: ln2Grads.dGamma, beta2: ln2Grads.dBeta,
+    },
+  };
 }

@@ -1,0 +1,652 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hot Word Detection – EfficientWord-Net</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { font-family: system-ui, sans-serif; margin: 0; background: #0f172a; color: #e2e8f0; }
+      header { padding: 0.75rem 1.25rem; border-bottom: 1px solid #1e293b; display: flex; align-items: baseline; gap: 1.5rem; }
+      header h1 { margin: 0; font-size: 1.1rem; }
+      header a { color: #38bdf8; font-size: 0.9rem; }
+
+      .layout { display: flex; height: calc(100vh - 53px); overflow: hidden; }
+
+      aside { width: 270px; min-width: 250px; flex-shrink: 0; overflow-y: auto; padding: 0.6rem; display: flex; flex-direction: column; gap: 0.5rem; background: #080f1a; border-right: 1px solid #1f2937; }
+      main  { flex: 1; overflow-y: auto; padding: 0.75rem; display: flex; flex-direction: column; gap: 0.75rem; }
+
+      .panel { background: #111827; border: 1px solid #1f2937; border-radius: 0.5rem; padding: 0.65rem; }
+      h2 { margin: 0 0 0.45rem; font-size: 0.82rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; }
+      h3 { margin: 0.6rem 0 0.3rem; font-size: 0.82rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; }
+
+      button { background: #1e293b; color: #e2e8f0; border: 1px solid #334155; border-radius: 0.4rem; padding: 0.35rem 0.7rem; cursor: pointer; font-size: 0.85rem; width: 100%; }
+      button:hover:not(:disabled) { background: #273549; }
+      button:disabled { opacity: 0.4; cursor: default; }
+      button.active { border-color: #22c55e; color: #4ade80; }
+
+      input[type="text"], input[type="number"] { background: #1e293b; color: #e2e8f0; border: 1px solid #334155; border-radius: 0.4rem; padding: 0.3rem 0.5rem; width: 100%; font-size: 0.85rem; }
+      input[type="range"] { width: 100%; accent-color: #38bdf8; }
+
+      label { font-size: 0.82rem; display: flex; flex-direction: column; gap: 0.2rem; margin-bottom: 0.35rem; }
+      label .label-row { display: flex; justify-content: space-between; }
+
+      .row { display: flex; gap: 0.4rem; margin-bottom: 0.4rem; }
+      .row button { flex: 1; }
+
+      .status { font-size: 0.78rem; color: #64748b; min-height: 1.1em; margin: 0.25rem 0; }
+      .hint   { font-size: 0.78rem; color: #475569; margin: 0.2rem 0 0.4rem; }
+
+      canvas { display: block; background: #020617; border-radius: 0.35rem; }
+
+      /* Sample thumbnails */
+      #sampleList { display: flex; flex-wrap: wrap; gap: 0.3rem; margin-top: 0.3rem; }
+      .thumb { position: relative; cursor: default; }
+      .thumb canvas { width: 60px; height: 30px; border-radius: 0.25rem; border: 1px solid #334155; }
+      .thumb .del { position: absolute; top: -4px; right: -4px; width: 14px; height: 14px; background: #ef4444; border-radius: 50%; border: none; padding: 0; font-size: 9px; line-height: 14px; text-align: center; cursor: pointer; color: #fff; display: none; }
+      .thumb:hover .del { display: block; }
+
+      /* Detection indicator */
+      #indicator {
+        font-size: 4rem;
+        text-align: center;
+        color: #334155;
+        transition: color 0.15s, text-shadow 0.15s;
+        user-select: none;
+        line-height: 1.2;
+      }
+      #indicator.detected {
+        color: #4ade80;
+        text-shadow: 0 0 24px #4ade80, 0 0 48px #22c55e;
+      }
+
+      /* Confidence / level bars */
+      #confidenceRow, #levelRow { display: flex; align-items: center; gap: 0.5rem; font-size: 0.8rem; margin: 0.3rem 0; }
+      #confidenceRow span:first-child, #levelRow span:first-child { width: 70px; flex-shrink: 0; color: #94a3b8; }
+      #confidenceTrack, #levelTrack { flex: 1; background: #1e293b; border-radius: 2px; height: 8px; overflow: hidden; }
+      #confidenceBar { height: 100%; background: #38bdf8; width: 0%; transition: width 0.1s, background 0.1s; border-radius: 2px; }
+      #levelBar      { height: 100%; background: #475569; width: 0%; transition: width 0.05s; border-radius: 2px; }
+      #confidenceVal { width: 36px; text-align: right; color: #94a3b8; font-size: 0.75rem; flex-shrink: 0; }
+
+      /* Detection log */
+      #detectionLog { font-size: 0.78rem; color: #64748b; display: flex; flex-direction: column; gap: 0.2rem; max-height: 180px; overflow-y: auto; }
+      .log-entry { color: #4ade80; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Hot Word Detection – EfficientWord-Net</h1>
+      <a href="/">← Index</a>
+    </header>
+
+    <div class="layout">
+      <aside>
+
+        <!-- Phase 1: Record hotword samples -->
+        <div class="panel">
+          <h2>1. Record Hotword Samples</h2>
+          <label>Hotword name<input id="hotwordName" type="text" value="hey-computer" /></label>
+          <p class="hint">Record 4–10 clear pronunciations. Each capture is 1.5 s.</p>
+          <button id="recordBtn">⏺ Record sample</button>
+          <p class="status" id="recordStatus">0 samples recorded.</p>
+          <canvas id="waveCanvas" width="242" height="56"></canvas>
+          <div id="sampleList"></div>
+        </div>
+
+        <!-- Phase 2: Background audio -->
+        <div class="panel">
+          <h2>2. Background Audio <span style="font-weight:normal;text-transform:none;letter-spacing:0">(optional)</span></h2>
+          <p class="hint">Improves accuracy; used only for training.</p>
+          <div class="row">
+            <button id="recordBgBtn">Record 3 s</button>
+            <button id="synthBgBtn">Synthetic</button>
+          </div>
+          <p class="status" id="bgStatus">None.</p>
+        </div>
+
+        <!-- Phase 3: Train -->
+        <div class="panel">
+          <h2>3. Train Model</h2>
+          <p class="hint">Requires ≥ 4 hotword samples and background audio.</p>
+          <label>
+            <div class="label-row"><span>Epochs</span></div>
+            <input id="epochsInput" type="number" value="50" min="10" max="300" />
+          </label>
+          <button id="trainBtn" disabled>Train</button>
+          <canvas id="lossCanvas" width="242" height="80"></canvas>
+          <p class="status" id="trainStatus">Not trained.</p>
+        </div>
+
+        <!-- Phase 4: Reference file -->
+        <div class="panel">
+          <h2>4. Reference File</h2>
+          <button id="genRefBtn" disabled>Generate reference</button>
+          <div class="row" style="margin-top:0.4rem">
+            <button id="saveRefBtn" disabled>Save JSON</button>
+            <button id="loadRefBtn">Load JSON</button>
+          </div>
+          <p class="status" id="refStatus">No reference.</p>
+        </div>
+
+      </aside>
+
+      <main>
+        <div class="panel">
+          <h2>Detection</h2>
+
+          <div class="row">
+            <button id="startBtn" disabled>▶ Start detection</button>
+            <button id="stopBtn"  disabled>■ Stop</button>
+          </div>
+
+          <label>
+            <div class="label-row">
+              <span>Threshold</span>
+              <span id="thresholdVal">0.70</span>
+            </div>
+            <input id="threshold" type="range" min="0.30" max="0.99" step="0.01" value="0.70" />
+          </label>
+
+          <div id="indicator">●</div>
+
+          <div id="confidenceRow">
+            <span>Confidence</span>
+            <div id="confidenceTrack"><div id="confidenceBar"></div></div>
+            <span id="confidenceVal">—</span>
+          </div>
+
+          <div id="levelRow">
+            <span>Mic level</span>
+            <div id="levelTrack"><div id="levelBar"></div></div>
+          </div>
+
+          <p class="status" id="detectionStatus">Load or generate a reference to begin.</p>
+
+          <h3>Recent detections</h3>
+          <div id="detectionLog"></div>
+        </div>
+      </main>
+    </div>
+
+    <script type="module">
+      import { createWebGL2Context } from '../../src/webgl/context.js';
+      import { buildProgramCache } from '../../src/webgl/program.js';
+      import { MATMUL_SHADERS } from '../../src/ops/matmul.js';
+      import { ELEMENTWISE_SHADERS } from '../../src/ops/elementwise.js';
+      import { REDUCE_SHADERS } from '../../src/ops/reduce.js';
+      import { LOSS_SHADERS } from '../../src/training/loss.js';
+      import { OPTIMIZER_SHADERS } from '../../src/training/optimizer.js';
+      import { createTrainer, trainEpoch } from '../../src/training/trainer.js';
+      import { createDataset } from '../../src/utils/data.js';
+
+      import {
+        extractLogMelFeatures, computeRms,
+        generateAugmentations, generateSyntheticBackground,
+        MicrophoneCapture, WINDOW_SAMPLES, SAMPLE_RATE,
+      } from './audio.js';
+
+      import {
+        createEfficientWordNetModel,
+        extractEmbedding, cosineSimilarity, maxCosineSimilarity,
+        serializeBackboneWeights, loadBackboneWeights,
+        N_MEL,
+      } from './model.js';
+
+      // ── WebGL setup ────────────────────────────────────────────────────────
+      const gl = createWebGL2Context(document.createElement('canvas'));
+      const programs = buildProgramCache(gl, {
+        ...MATMUL_SHADERS,
+        ...ELEMENTWISE_SHADERS,
+        ...REDUCE_SHADERS,
+        ...LOSS_SHADERS,
+        ...OPTIMIZER_SHADERS,
+      });
+      let model = createEfficientWordNetModel(gl);
+
+      // ── State ──────────────────────────────────────────────────────────────
+      let mic = new MicrophoneCapture();
+      let hotwordAudioSamples = [];   // Float32Array[], each WINDOW_SAMPLES long
+      let bgMelSamples = [];          // Float32Array[], each N_MEL long (time-averaged mel)
+      let reference = null;           // { hotword, created, trained, embeddings, weights }
+      let trainer = null;
+      let lossHistory = [];
+
+      // Detection state
+      let detectionActive = false;
+      let audioRingBuffer = new Float32Array(WINDOW_SAMPLES);
+      let ringWritePos = 0;
+      let samplesSinceLastProcess = 0;
+      const PROCESS_INTERVAL = Math.floor(SAMPLE_RATE * 0.1);  // every 100 ms
+      const MIN_RMS_FOR_DETECTION = 0.005;
+      const RELAXATION_FRAMES = 8;  // ignore rapid re-triggers (~800 ms)
+      let framesUntilNextTrigger = 0;
+
+      // Recording state
+      let isRecording = false;
+      let isRecordingBg = false;
+      let recordBuf = [];
+      let recordTarget = 0;
+
+      // ── DOM refs ───────────────────────────────────────────────────────────
+      const hotwordNameInput  = document.getElementById('hotwordName');
+      const recordBtn         = document.getElementById('recordBtn');
+      const recordStatus      = document.getElementById('recordStatus');
+      const waveCanvas        = document.getElementById('waveCanvas');
+      const sampleListEl      = document.getElementById('sampleList');
+      const recordBgBtn       = document.getElementById('recordBgBtn');
+      const synthBgBtn        = document.getElementById('synthBgBtn');
+      const bgStatus          = document.getElementById('bgStatus');
+      const epochsInput       = document.getElementById('epochsInput');
+      const trainBtn          = document.getElementById('trainBtn');
+      const lossCanvas        = document.getElementById('lossCanvas');
+      const trainStatus       = document.getElementById('trainStatus');
+      const genRefBtn         = document.getElementById('genRefBtn');
+      const saveRefBtn        = document.getElementById('saveRefBtn');
+      const loadRefBtn        = document.getElementById('loadRefBtn');
+      const refStatus         = document.getElementById('refStatus');
+      const startBtn          = document.getElementById('startBtn');
+      const stopBtn           = document.getElementById('stopBtn');
+      const thresholdInput    = document.getElementById('threshold');
+      const thresholdVal      = document.getElementById('thresholdVal');
+      const indicator         = document.getElementById('indicator');
+      const confidenceBar     = document.getElementById('confidenceBar');
+      const confidenceVal     = document.getElementById('confidenceVal');
+      const levelBar          = document.getElementById('levelBar');
+      const detectionStatus   = document.getElementById('detectionStatus');
+      const detectionLog      = document.getElementById('detectionLog');
+
+      // ── Helpers ────────────────────────────────────────────────────────────
+      function updateButtonStates() {
+        const n = hotwordAudioSamples.length;
+        genRefBtn.disabled  = n < 4;
+        trainBtn.disabled   = n < 4 || bgMelSamples.length === 0;
+        saveRefBtn.disabled = reference === null;
+        startBtn.disabled   = reference === null || detectionActive;
+        stopBtn.disabled    = !detectionActive;
+        // Disable recording buttons while detection is running (mic handler would conflict)
+        recordBtn.disabled    = detectionActive;
+        recordBgBtn.disabled  = detectionActive;
+        recordStatus.textContent = `${n} sample${n !== 1 ? 's' : ''} recorded.`;
+      }
+
+      function drawWaveform(canvas, audioBuffer, color = '#38bdf8') {
+        const ctx = canvas.getContext('2d');
+        const { width, height } = canvas;
+        ctx.clearRect(0, 0, width, height);
+        ctx.fillStyle = '#020617';
+        ctx.fillRect(0, 0, width, height);
+        if (!audioBuffer || audioBuffer.length === 0) return;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        const step = Math.max(1, Math.floor(audioBuffer.length / width));
+        for (let x = 0; x < width; x++) {
+          const idx = Math.floor(x * audioBuffer.length / width);
+          const slice = audioBuffer.slice(idx, idx + step);
+          let max = 0;
+          for (const v of slice) if (Math.abs(v) > Math.abs(max)) max = v;
+          const y = height / 2 - max * (height / 2 - 2);
+          if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+      }
+
+      function addSampleThumbnail(audio, index) {
+        const div = document.createElement('div');
+        div.className = 'thumb';
+        const cvs = document.createElement('canvas');
+        cvs.width = 120; cvs.height = 30;
+        drawWaveform(cvs, audio, '#4ade80');
+        const del = document.createElement('button');
+        del.className = 'del';
+        del.textContent = '×';
+        del.title = `Delete sample ${index + 1}`;
+        del.onclick = () => {
+          hotwordAudioSamples.splice(index, 1);
+          sampleListEl.innerHTML = '';
+          hotwordAudioSamples.forEach((a, i) => addSampleThumbnail(a, i));
+          updateButtonStates();
+        };
+        div.appendChild(cvs);
+        div.appendChild(del);
+        sampleListEl.appendChild(div);
+      }
+
+      function drawLoss() {
+        const ctx = lossCanvas.getContext('2d');
+        const { width, height } = lossCanvas;
+        ctx.clearRect(0, 0, width, height);
+        ctx.fillStyle = '#020617';
+        ctx.fillRect(0, 0, width, height);
+        if (lossHistory.length < 2) return;
+        const maxL = Math.max(...lossHistory);
+        const minL = Math.min(...lossHistory);
+        const range = Math.max(maxL - minL, 1e-6);
+        ctx.strokeStyle = '#22c55e';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        lossHistory.forEach((loss, i) => {
+          const x = (i / (lossHistory.length - 1)) * width;
+          const y = height - ((loss - minL) / range) * (height - 8) - 4;
+          if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+        // Last loss label
+        ctx.fillStyle = '#94a3b8';
+        ctx.font = '10px system-ui';
+        ctx.fillText(lossHistory.at(-1).toFixed(4), 4, 12);
+      }
+
+      function setDetected(confidence) {
+        indicator.classList.add('detected');
+        confidenceBar.style.background = '#4ade80';
+        setTimeout(() => {
+          indicator.classList.remove('detected');
+          confidenceBar.style.background = '#38bdf8';
+        }, 800);
+        const now = new Date().toLocaleTimeString();
+        const entry = document.createElement('div');
+        entry.className = 'log-entry';
+        entry.textContent = `${now}  "${reference?.hotword ?? '?'}"  (${(confidence * 100).toFixed(1)} %)`;
+        detectionLog.prepend(entry);
+        while (detectionLog.children.length > 12) detectionLog.lastElementChild.remove();
+      }
+
+      function updateConfidence(sim) {
+        const pct = Math.max(0, Math.min(100, ((sim + 1) / 2) * 100));
+        confidenceBar.style.width = `${pct}%`;
+        confidenceVal.textContent = sim > -1 ? `${(sim * 100).toFixed(0)}%` : '—';
+      }
+
+      // ── Microphone helpers ─────────────────────────────────────────────────
+      async function ensureMic() {
+        if (!mic.active) await mic.start();
+      }
+
+      // Collect exactly `targetSamples` from the mic into a Float32Array
+      function captureAudio(targetSamples) {
+        return new Promise((resolve) => {
+          const buf = [];
+          mic.onChunk = (chunk) => {
+            for (const s of chunk) buf.push(s);
+            if (buf.length >= targetSamples) {
+              mic.onChunk = null;
+              resolve(new Float32Array(buf.slice(0, targetSamples)));
+            }
+          };
+        });
+      }
+
+      // ── Phase 1: Record hotword ────────────────────────────────────────────
+      recordBtn.addEventListener('click', async () => {
+        if (isRecording || isRecordingBg) return;
+        isRecording = true;
+        recordBtn.disabled = true;
+        recordBtn.textContent = '⏺ Recording…';
+        recordStatus.textContent = 'Speak the hotword now…';
+
+        try {
+          await ensureMic();
+          const audio = await captureAudio(WINDOW_SAMPLES);
+          hotwordAudioSamples.push(audio);
+          drawWaveform(waveCanvas, audio);
+          sampleListEl.innerHTML = '';
+          hotwordAudioSamples.forEach((a, i) => addSampleThumbnail(a, i));
+        } catch (err) {
+          recordStatus.textContent = `Error: ${err.message}`;
+        } finally {
+          isRecording = false;
+          recordBtn.disabled = false;
+          recordBtn.textContent = '⏺ Record sample';
+          updateButtonStates();
+        }
+      });
+
+      // ── Phase 2: Background audio ──────────────────────────────────────────
+      recordBgBtn.addEventListener('click', async () => {
+        if (isRecording || isRecordingBg) return;
+        isRecordingBg = true;
+        recordBgBtn.disabled = true;
+        recordBgBtn.textContent = 'Recording…';
+        bgStatus.textContent = 'Recording 3 s of background…';
+
+        try {
+          await ensureMic();
+          const audio = await captureAudio(SAMPLE_RATE * 3);  // 3 seconds
+          // Split into two 1.5 s windows
+          const w1 = audio.slice(0, WINDOW_SAMPLES);
+          const w2 = audio.slice(WINDOW_SAMPLES, 2 * WINDOW_SAMPLES);
+          bgMelSamples = [extractLogMelFeatures(w1), extractLogMelFeatures(w2)];
+          bgStatus.textContent = `2 background windows captured.`;
+        } catch (err) {
+          bgStatus.textContent = `Error: ${err.message}`;
+        } finally {
+          isRecordingBg = false;
+          recordBgBtn.disabled = false;
+          recordBgBtn.textContent = 'Record 3 s';
+          updateButtonStates();
+        }
+      });
+
+      synthBgBtn.addEventListener('click', () => {
+        bgMelSamples = generateSyntheticBackground(6);
+        bgStatus.textContent = `6 synthetic background samples (silence, noise, hum).`;
+        updateButtonStates();
+      });
+
+      // ── Phase 3: Train model ───────────────────────────────────────────────
+      trainBtn.addEventListener('click', async () => {
+        if (hotwordAudioSamples.length < 4 || bgMelSamples.length === 0) return;
+        trainBtn.disabled = true;
+        trainStatus.textContent = 'Preparing dataset…';
+        lossHistory = [];
+
+        // Build augmented training dataset
+        const inputs = [];
+        const labels = [];
+
+        for (const audio of hotwordAudioSamples) {
+          const augmented = generateAugmentations(audio, 15);
+          for (const mel of augmented) { inputs.push(mel); labels.push(1); }
+        }
+
+        const bgAugs = Math.max(1, Math.ceil((inputs.length / 2) / bgMelSamples.length));
+        for (const mel of bgMelSamples) {
+          // Augment background mel features directly (add noise, scale)
+          for (let a = 0; a < bgAugs; a++) {
+            const noisy = new Float32Array(mel.length);
+            const scale = 0.8 + Math.random() * 0.4;
+            const noise = Math.random() * 0.3;
+            for (let i = 0; i < mel.length; i++) {
+              noisy[i] = mel[i] * scale + (Math.random() * 2 - 1) * noise;
+            }
+            inputs.push(noisy); labels.push(0);
+          }
+        }
+
+        const dataset = createDataset(inputs, labels);
+        // Reset model for fresh training
+        model = createEfficientWordNetModel(gl);
+        trainer = createTrainer(gl, programs, model, {
+          lr: 0.003, beta1: 0.9, beta2: 0.999, eps: 1e-8,
+          batchSize: 8, loss: 'crossEntropy',
+        });
+
+        const epochs = Math.max(10, Math.min(300, Number(epochsInput.value)));
+        trainStatus.textContent = `Training (0/${epochs})…`;
+
+        // Yield to the browser between epochs so the UI stays responsive
+        for (let epoch = 0; epoch < epochs; epoch++) {
+          const { avgLoss } = trainEpoch(gl, programs, trainer, dataset);
+          lossHistory.push(avgLoss);
+          drawLoss();
+          if ((epoch + 1) % 5 === 0 || epoch === epochs - 1) {
+            trainStatus.textContent = `Epoch ${epoch + 1}/${epochs}  loss ${avgLoss.toFixed(4)}`;
+          }
+          // Yield every 5 epochs
+          if (epoch % 5 === 4) await new Promise((r) => setTimeout(r, 0));
+        }
+
+        trainStatus.textContent = `Done. Final loss: ${lossHistory.at(-1).toFixed(4)}`;
+        trainBtn.disabled = false;
+        updateButtonStates();
+      });
+
+      // ── Phase 4: Reference file ────────────────────────────────────────────
+      genRefBtn.addEventListener('click', () => {
+        const hotword = hotwordNameInput.value.trim() || 'hotword';
+        // Keep as Float32Arrays in-memory for efficient cosine similarity; serialise via Array.from in saveRefBtn
+        const embeddings = hotwordAudioSamples.map((audio) => {
+          const mel = extractLogMelFeatures(audio);
+          return extractEmbedding(gl, programs, model, mel);
+        });
+        const weights = serializeBackboneWeights(gl, model);
+        reference = {
+          version: 1,
+          hotword,
+          created: new Date().toISOString(),
+          sampleCount: embeddings.length,
+          trained: lossHistory.length > 0,
+          nMel: N_MEL,
+          embeddings,
+          weights,
+        };
+        refStatus.textContent = `Reference generated: "${hotword}" (${embeddings.length} embeddings, trained: ${reference.trained}).`;
+        updateButtonStates();
+      });
+
+      saveRefBtn.addEventListener('click', () => {
+        if (!reference) return;
+        // Serialise Float32Arrays to plain arrays for JSON
+        const serialisable = {
+          ...reference,
+          embeddings: reference.embeddings.map((e) => Array.from(e)),
+        };
+        const json = JSON.stringify(serialisable, null, 2);
+        const blob = new Blob([json], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${reference.hotword}_ref.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+      });
+
+      loadRefBtn.addEventListener('click', () => {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = '.json,application/json';
+        input.onchange = async () => {
+          const file = input.files?.[0];
+          if (!file) return;
+          try {
+            const text = await file.text();
+            const data = JSON.parse(text);
+            if (!data.embeddings || !data.weights) throw new Error('Invalid reference file format.');
+            reference = {
+              ...data,
+              // Pre-convert to Float32Array for efficient per-frame comparison
+              embeddings: data.embeddings.map((e) => new Float32Array(e)),
+            };
+            // Restore backbone weights so future embeddings are consistent
+            loadBackboneWeights(gl, model, data.weights);
+            refStatus.textContent = `Loaded: "${reference.hotword}" (${reference.embeddings.length} embeddings, trained: ${reference.trained}).`;
+            updateButtonStates();
+          } catch (err) {
+            refStatus.textContent = `Error loading file: ${err.message}`;
+          }
+        };
+        input.click();
+      });
+
+      // ── Threshold display ──────────────────────────────────────────────────
+      thresholdInput.addEventListener('input', () => {
+        thresholdVal.textContent = Number(thresholdInput.value).toFixed(2);
+      });
+
+      // ── Detection ─────────────────────────────────────────────────────────
+      function processDetectionWindow() {
+        if (!reference || !detectionActive) return;
+
+        // Build a contiguous copy of the ring buffer (most recent WINDOW_SAMPLES)
+        const window = new Float32Array(WINDOW_SAMPLES);
+        for (let i = 0; i < WINDOW_SAMPLES; i++) {
+          window[i] = audioRingBuffer[(ringWritePos + i) % WINDOW_SAMPLES];
+        }
+
+        const rms = computeRms(window);
+        const levelPct = Math.min(100, (rms / 0.1) * 100);
+        levelBar.style.width = `${levelPct}%`;
+
+        if (rms < MIN_RMS_FOR_DETECTION) {
+          updateConfidence(-1);
+          return;
+        }
+
+        const mel = extractLogMelFeatures(window);
+        const emb = extractEmbedding(gl, programs, model, mel);
+        // reference.embeddings are pre-converted to Float32Array when reference is set/loaded
+        const sim = maxCosineSimilarity(emb, reference.embeddings);
+
+        updateConfidence(sim);
+
+        const threshold = Number(thresholdInput.value);
+        if (sim >= threshold && framesUntilNextTrigger <= 0) {
+          setDetected(sim);
+          framesUntilNextTrigger = RELAXATION_FRAMES;
+        }
+        if (framesUntilNextTrigger > 0) framesUntilNextTrigger--;
+      }
+
+      startBtn.addEventListener('click', async () => {
+        if (!reference) return;
+        try {
+          await ensureMic();
+        } catch (err) {
+          detectionStatus.textContent = `Microphone error: ${err.message}`;
+          return;
+        }
+
+        // Reset ring buffer
+        audioRingBuffer = new Float32Array(WINDOW_SAMPLES);
+        ringWritePos = 0;
+        samplesSinceLastProcess = 0;
+        framesUntilNextTrigger = 0;
+        detectionActive = true;
+
+        mic.onChunk = (chunk) => {
+          for (const sample of chunk) {
+            audioRingBuffer[ringWritePos] = sample;
+            ringWritePos = (ringWritePos + 1) % WINDOW_SAMPLES;
+            samplesSinceLastProcess++;
+          }
+          if (samplesSinceLastProcess >= PROCESS_INTERVAL) {
+            samplesSinceLastProcess = 0;
+            processDetectionWindow();
+          }
+        };
+
+        startBtn.disabled = true;
+        stopBtn.disabled  = false;
+        detectionStatus.textContent = `Listening for "${reference.hotword}"…`;
+        indicator.classList.remove('detected');
+      });
+
+      stopBtn.addEventListener('click', () => {
+        detectionActive = false;
+        mic.onChunk = null;
+        if (!isRecording && !isRecordingBg) mic.stop();
+        startBtn.disabled  = reference === null;
+        stopBtn.disabled   = true;
+        detectionStatus.textContent = 'Detection stopped.';
+        levelBar.style.width = '0%';
+        confidenceBar.style.width = '0%';
+        confidenceVal.textContent = '—';
+        indicator.classList.remove('detected');
+      });
+
+      // ── Init ───────────────────────────────────────────────────────────────
+      updateButtonStates();
+    </script>
+  </body>
+</html>

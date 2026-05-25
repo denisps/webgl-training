@@ -28,6 +28,25 @@ export function downloadWeights(gl, weightTensors, filename = 'weights.json') {
   URL.revokeObjectURL(url);
 }
 
+// Save model weights together with any metadata (e.g. architecture) so the
+// file is self-contained for later inference. The saved format is:
+//   { ...metadata, weights: [{rows, cols, data}, ...] }
+// loadModelWeights() in inference/model.js already reads this format.
+export function downloadModel(gl, metadata, weightTensors, filename = 'model.json') {
+  const weights = weightTensors.map((tensor) => ({
+    rows: tensor.rows,
+    cols: tensor.cols,
+    data: Array.from(readTensor(gl, tensor)),
+  }));
+  const blob = new Blob([JSON.stringify({ ...metadata, weights }, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
 export function loadWeightsFromFile() {
   return new Promise((resolve, reject) => {
     const input = document.createElement('input');

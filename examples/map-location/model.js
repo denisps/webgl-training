@@ -80,6 +80,7 @@ export function createMapModel(gl, nRegions = 8) {
     architecture: {
       type: 'patch-transformer',
       nRegions,
+      regionSize: REGION_SIZE,
       patchSide: PATCH_SIDE,
       seqLen: SEQ_LEN,
       dModel: D_MODEL,

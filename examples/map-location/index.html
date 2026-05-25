@@ -65,7 +65,7 @@
       import { TRANSFORMER_SHADERS } from '../../src/layers/transformer.js';
       import { createTrainer, trainStep } from '../../src/training/trainer.js';
       import { createDataset, shuffleDataset, getBatch } from '../../src/utils/data.js';
-      import { downloadWeights, loadWeightsFromFile } from '../../src/utils/serialize.js';
+      import { downloadModel, loadWeightsFromFile } from '../../src/utils/serialize.js';
       import { loadModelWeights } from '../../src/inference/model.js';
       import { runBatchInference } from '../../src/inference/runner.js';
       import { generateMap, generateTrainingPatches, extractPatch, assignRegionsByGrid, generateGridTrainingPatches } from './mapgen.js';
@@ -336,6 +336,10 @@
         }
       }
 
+      function regionColor(regionIndex, nRegions) {
+        return `hsl(${Math.round((regionIndex / nRegions) * 360)}, 65%, 55%)`;
+      }
+
       async function predictAt(x, y) {
         const patch = extractPatch(mapState.imageData, mapWidth, x, y, REGION_SIZE);
         renderPatch(patch);
@@ -349,7 +353,12 @@
           }
         }
         const truth = mapState.regionMask[y * mapWidth + x];
-        predictionLabel.textContent = `Prediction: region ${bestIndex} | ground truth: region ${truth}`;
+        const nRegions = model.architecture.nRegions;
+        const swatch = (color) => `<span style="display:inline-block;width:13px;height:13px;border-radius:3px;vertical-align:middle;margin:0 5px 1px 0;background:${color}"></span>`;
+        const match = bestIndex === truth ? '&#10003; correct' : '&#10007; wrong';
+        predictionLabel.innerHTML =
+          `${swatch(regionColor(bestIndex, nRegions))}Predicted: region ${bestIndex}&nbsp;&nbsp;&nbsp;` +
+          `${swatch(regionColor(truth, nRegions))}Ground truth: region ${truth}&nbsp;&nbsp;${match}`;
       }
 
       mapCanvas.addEventListener('click', (event) => {
@@ -378,12 +387,29 @@
       document.getElementById('trainBtn').addEventListener('click', train);
       document.getElementById('stopBtn').addEventListener('click', () => { stopRequested = true; });
       document.getElementById('resetBtn').addEventListener('click', initFromGeneratedMap);
-      document.getElementById('downloadBtn').addEventListener('click', () => downloadWeights(gl, model.parameters, 'map-location-weights.json'));
+      document.getElementById('downloadBtn').addEventListener('click', () => {
+        downloadModel(gl, { architecture: model.architecture }, model.parameters, 'map-location-model.json');
+      });
       document.getElementById('uploadBtn').addEventListener('click', async () => {
         const parsed = await loadWeightsFromFile();
-        if (parsed) {
+        if (!parsed) return;
+        try {
+          if (parsed.architecture) {
+            const arch = parsed.architecture;
+            if (arch.regionSize && arch.regionSize !== REGION_SIZE) {
+              statusLabel.textContent = `Warning: file trained with regionSize=${arch.regionSize}, current is ${REGION_SIZE}. Weights loaded anyway.`;
+            }
+            if (arch.nRegions !== model.architecture.nRegions) {
+              resetModel(arch.nRegions);
+              regionsInput.value = arch.nRegions;
+            }
+          }
           loadModelWeights(gl, model, parsed);
-          statusLabel.textContent = 'Weights loaded.';
+          if (!parsed.architecture || parsed.architecture.regionSize === REGION_SIZE) {
+            statusLabel.textContent = 'Weights loaded.';
+          }
+        } catch (error) {
+          statusLabel.textContent = `Error loading weights: ${error.message}`;
         }
       });
 

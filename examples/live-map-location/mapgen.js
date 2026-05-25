@@ -1,7 +1,10 @@
 // Training scale factor range in log2 space (scaleFactor = source pixels per patch pixel).
-// Range [2^-1, 2^2] = [0.5, 4] covers fine-detail through wider context crops.
+// Range [2^-1, 2^1] = [0.5, 2] — at 2× on a 256-px map the patch covers 128×128 source
+// pixels (one quarter of the map area), giving enough context while keeping position
+// distinguishable.  Scale=4 (old max) forced all samples to the map centre and produced
+// black-filled patches near edges, so it is no longer included.
 export const TRAIN_LOG2_SCALE_MIN = -1;
-export const TRAIN_LOG2_SCALE_MAX = 2;
+export const TRAIN_LOG2_SCALE_MAX = 1;
 
 // Encode scaleFactor → [0, 1] within the training range.
 export function encodeScaleNorm(scaleFactor) {
@@ -156,9 +159,10 @@ export async function generateProceduralMap(width, height, nCenters = 12) {
  * Each entry: { bitmap, width, height, bounds: { latMin, latMax, lonMin, lonMax } }
  *
  * Patches are sampled at random positions and random log-uniform scales within
- * [TRAIN_LOG2_SCALE_MIN, TRAIN_LOG2_SCALE_MAX], with no rotation (north-up).
- * Inference pre-rotates patches by the compass heading before feeding the model,
- * so all patches the model ever sees are north-aligned.
+ * [TRAIN_LOG2_SCALE_MIN, TRAIN_LOG2_SCALE_MAX].  The centre is chosen so that the
+ * entire extraction window fits inside the source map — no black fill is ever produced.
+ * All patches are north-aligned (rotationRad = 0); inference pre-rotates by compass
+ * heading before feeding the model.
  *
  * @returns {{ inputs: Float32Array[], labels: Float32Array[] }}
  */
@@ -171,12 +175,16 @@ export function generateMultiScaleTrainingData(mapEntries, patchSize, samplesPer
 
   for (const entry of mapEntries) {
     const { bitmap, width, height, bounds } = entry;
-    const half = patchSize / 2;
     for (let s = 0; s < samplesPerMap; s += 1) {
-      const cx = half + Math.random() * Math.max(1, width  - patchSize);
-      const cy = half + Math.random() * Math.max(1, height - patchSize);
+      // Choose scale first so the centre margin can account for it.
       const log2Scale = TRAIN_LOG2_SCALE_MIN + Math.random() * (TRAIN_LOG2_SCALE_MAX - TRAIN_LOG2_SCALE_MIN);
       const scaleFactor = Math.pow(2, log2Scale);
+      // The extraction window extends scaleFactor*(patchSize/2) source pixels from the
+      // centre in each direction.  Clamp to half the map size so the window always fits.
+      const marginX = Math.min((patchSize / 2) * scaleFactor, width  / 2);
+      const marginY = Math.min((patchSize / 2) * scaleFactor, height / 2);
+      const cx = marginX + Math.random() * Math.max(0, width  - 2 * marginX);
+      const cy = marginY + Math.random() * Math.max(0, height - 2 * marginY);
       const rotationRad = 0;
       const patch = extractTransformedPatch(bitmap, cx, cy, scaleFactor, rotationRad, patchSize, patchCanvas);
       const label = computePatchLabel(cx, cy, width, height, bounds, scaleFactor, patchSize);

@@ -465,8 +465,13 @@
         const srcX = canvasX / mapCanvas.width  * entry.width;
         const srcY = canvasY / mapCanvas.height * entry.height;
 
-        // Random scale in training range
-        const log2Scale = TRAIN_LOG2_SCALE_MIN + Math.random() * (TRAIN_LOG2_SCALE_MAX - TRAIN_LOG2_SCALE_MIN);
+        // Random scale clamped so the extraction window stays inside the map.
+        const maxSafeScale = Math.min(
+          srcX, entry.width  - srcX,
+          srcY, entry.height - srcY,
+        ) / (REGION_SIZE / 2);
+        const clampedLog2ScaleMax = Math.min(TRAIN_LOG2_SCALE_MAX, Math.log2(Math.max(1, maxSafeScale)));
+        const log2Scale = TRAIN_LOG2_SCALE_MIN + Math.random() * Math.max(0, clampedLog2ScaleMax - TRAIN_LOG2_SCALE_MIN);
         const scaleFactor = Math.pow(2, log2Scale);
         const patch = extractTransformedPatch(entry.bitmap, srcX, srcY, scaleFactor, 0, REGION_SIZE, _patchCanvas);
         renderPatch(patch);

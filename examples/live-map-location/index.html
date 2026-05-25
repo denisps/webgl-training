@@ -77,7 +77,7 @@
 
         <h2>Dataset &amp; Training</h2>
         <div class="controls">
-          <label title="Number of training patches sampled per map image — more gives better geographic coverage but slower dataset generation">Samples/map <input id="samplesInput" type="number" min="50" max="5000" value="500" /></label>
+          <label title="Number of training patches sampled per map image — more gives better geographic coverage but slower dataset generation">Samples/map <input id="samplesInput" type="number" min="50" max="5000" value="1000" /></label>
           <button id="buildDatasetBtn" title="Generate multi-scale training patches at random positions and scales from all loaded maps">Build dataset</button>
         </div>
         <div class="controls">
@@ -472,6 +472,7 @@
         renderPatch(patch);
 
         const output = runBatchInference(gl, programs, model, patch);
+        console.log('Raw model output:', Array.from(output));
         const pred = decodePrediction(output, entry.bounds);
 
         // Actual

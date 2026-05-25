@@ -156,8 +156,9 @@ export async function generateProceduralMap(width, height, nCenters = 12) {
  * Each entry: { bitmap, width, height, bounds: { latMin, latMax, lonMin, lonMax } }
  *
  * Patches are sampled at random positions and random log-uniform scales within
- * [TRAIN_LOG2_SCALE_MIN, TRAIN_LOG2_SCALE_MAX], with small rotation augmentation
- * (±30°) to match the compass-corrected patches seen at inference time.
+ * [TRAIN_LOG2_SCALE_MIN, TRAIN_LOG2_SCALE_MAX], with no rotation (north-up).
+ * Inference pre-rotates patches by the compass heading before feeding the model,
+ * so all patches the model ever sees are north-aligned.
  *
  * @returns {{ inputs: Float32Array[], labels: Float32Array[] }}
  */
@@ -176,7 +177,7 @@ export function generateMultiScaleTrainingData(mapEntries, patchSize, samplesPer
       const cy = half + Math.random() * Math.max(1, height - patchSize);
       const log2Scale = TRAIN_LOG2_SCALE_MIN + Math.random() * (TRAIN_LOG2_SCALE_MAX - TRAIN_LOG2_SCALE_MIN);
       const scaleFactor = Math.pow(2, log2Scale);
-      const rotationRad = (Math.random() - 0.5) * Math.PI / 3;  // ±30°
+      const rotationRad = 0;
       const patch = extractTransformedPatch(bitmap, cx, cy, scaleFactor, rotationRad, patchSize, patchCanvas);
       const label = computePatchLabel(cx, cy, width, height, bounds, scaleFactor, patchSize);
       inputs.push(patch);

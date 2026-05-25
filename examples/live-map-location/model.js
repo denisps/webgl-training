@@ -46,8 +46,8 @@ export function geoRegressionModelFwd(gl, programs, input, weights) {
   }
   // 5. Average-pool over tokens: → [batch, D_MODEL]
   const pooled = meanPool(gl, programs, current, input.rows, SEQ_LEN);
-  // 6. Regression head: → [batch, OUTPUT_DIM]
-  const logits = denseFwd(gl, programs, pooled, weights.head, 'linear');
+  // 6. Regression head: → [batch, OUTPUT_DIM]  sigmoid clamps output to (0,1).
+  const logits = denseFwd(gl, programs, pooled, weights.head, 'sigmoid');
   return {
     output: logits.output,
     cache: { patched, embedded, withPos, txOuts, pooled, logits },
@@ -55,7 +55,7 @@ export function geoRegressionModelFwd(gl, programs, input, weights) {
 }
 
 export function geoRegressionModelBwd(gl, programs, input, weights, cache, dOutput) {
-  const gHead    = denseBwd(gl, programs, cache.pooled, weights.head, cache.logits.preActivation, dOutput, 'linear');
+  const gHead    = denseBwd(gl, programs, cache.pooled, weights.head, cache.logits.preActivation, dOutput, 'sigmoid');
   let dCurrent   = meanPoolBwd(gl, programs, gHead.dInput, input.rows * SEQ_LEN, SEQ_LEN);
   destroyTensor(gl, gHead.dInput);
 

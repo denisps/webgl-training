@@ -62,5 +62,6 @@ export function denseBwd(gl, programs, input, weights, preActivation, dOutput, a
   const dW = matmulAt(gl, programs, input, dZ);
   const db = sumCols(gl, programs, dZ);
   const dInput = matmulBt(gl, programs, dZ, weights.W);
+  destroyTensor(gl, dZ);
   return { dInput, dW, db };
 }

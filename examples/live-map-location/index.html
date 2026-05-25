@@ -23,14 +23,37 @@
       label { display: inline-flex; gap: 0.4rem; align-items: center; font-size: 0.9rem; }
 
       /* Map entry cards */
-      #mapList { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 0.75rem; max-height: 280px; overflow-y: auto; }
-      .map-entry { display: flex; gap: 0.6rem; align-items: flex-start; background: #0f172a; border: 1px solid #1f2937; border-radius: 0.5rem; padding: 0.5rem; }
-      .map-entry canvas { width: 72px; height: 72px; flex-shrink: 0; cursor: pointer; border-radius: 0.375rem; }
-      .map-entry canvas.selected { outline: 2px solid #38bdf8; }
-      .map-entry .bounds { display: grid; grid-template-columns: 1fr 1fr; gap: 0.3rem; flex: 1; }
-      .map-entry .bounds input { width: 100%; }
-      .map-entry .entry-footer { display: flex; gap: 0.4rem; align-items: center; margin-top: 0.3rem; font-size: 0.8rem; color: #64748b; }
-      .map-entry .entry-footer button { padding: 0.2rem 0.5rem; font-size: 0.8rem; }
+      #mapList { display: flex; flex-direction: column; gap: 0.75rem; margin-bottom: 0.75rem; max-height: 520px; overflow-y: auto; padding-right: 2px; }
+
+      .map-entry { background: #0f172a; border: 1px solid #1f2937; border-radius: 0.5rem; padding: 0.5rem; }
+
+      /* Top ruler: lon-min left, lon-max right, indented to align with canvas */
+      .map-top-ruler { display: flex; justify-content: space-between; padding-left: 46px; margin-bottom: 0.25rem; }
+
+      /* Middle row: lat ruler + canvas */
+      .map-row { display: flex; gap: 0.3rem; align-items: stretch; }
+
+      /* Left lat ruler: lat-max at top, lat-min at bottom */
+      .map-lat-ruler { display: flex; flex-direction: column; justify-content: space-between; width: 42px; flex-shrink: 0; }
+
+      /* Canvas fills remaining width; height follows its own aspect ratio */
+      .map-row canvas { flex: 1; min-width: 0; display: block; cursor: pointer; border-radius: 0.4rem;
+        box-shadow: 0 10px 28px rgba(0,0,0,0.6), 0 3px 8px rgba(0,0,0,0.4);
+        max-width: 100%; height: auto; }
+      .map-row canvas.selected {
+        outline: 2px solid #38bdf8;
+        box-shadow: 0 10px 28px rgba(0,0,0,0.6), 0 3px 8px rgba(0,0,0,0.4), 0 0 0 2px #38bdf8; }
+
+      /* Compact coordinate inputs used in the rulers */
+      .bounds-input { width: 42px; font-size: 0.7rem; padding: 0.18rem 0.25rem; text-align: center;
+        background: #0b1120; border: 1px solid #1e293b; border-radius: 0.3rem; color: #64748b;
+        transition: color 0.15s, border-color 0.15s; }
+      .bounds-input:focus { color: #e2e8f0; border-color: #334155; outline: none; }
+      .bounds-input:hover { color: #cbd5e1; }
+
+      .map-entry .entry-footer { display: flex; gap: 0.4rem; align-items: center; margin-top: 0.4rem;
+        font-size: 0.8rem; color: #64748b; }
+      .map-entry .entry-footer button { padding: 0.2rem 0.5rem; font-size: 0.8rem; width: auto; }
     </style>
   </head>
   <body>
@@ -48,29 +71,29 @@
         <h2>Maps</h2>
         <div id="mapList"></div>
         <div class="controls">
-          <button id="addProceduralBtn">Add procedural map</button>
-          <button id="addImageBtn">Add image…</button>
+          <button id="addProceduralBtn" title="Add a synthetically generated Voronoi colour map (useful for quick testing without real imagery)">Add procedural map</button>
+          <button id="addImageBtn" title="Load a real map image from disk and assign geographic bounds to it">Add image…</button>
         </div>
 
         <h2>Dataset &amp; Training</h2>
         <div class="controls">
-          <label>Samples/map <input id="samplesInput" type="number" min="50" max="5000" value="300" /></label>
-          <button id="buildDatasetBtn">Build dataset</button>
+          <label title="Number of training patches sampled per map image — more gives better geographic coverage but slower dataset generation">Samples/map <input id="samplesInput" type="number" min="50" max="5000" value="300" /></label>
+          <button id="buildDatasetBtn" title="Generate multi-scale training patches at random positions and scales from all loaded maps">Build dataset</button>
         </div>
         <div class="controls">
           <button id="trainBtn" disabled>Train</button>
-          <button id="stopBtn">Stop</button>
-          <button id="resetBtn">Reset model</button>
-          <label>LR <input id="lrInput" type="range" min="0.0002" max="0.01" step="0.0002" value="0.002" /></label>
-          <label>Epochs <input id="epochsInput" type="number" min="1" max="200" value="30" /></label>
+          <button id="stopBtn" title="Stop training after the current batch">Stop</button>
+          <button id="resetBtn" title="Re-initialise model weights from scratch (discards all training progress)">Reset model</button>
+          <label title="Adam learning rate — lower values are more stable but converge slower">LR <input id="lrInput" type="range" min="0.0002" max="0.01" step="0.0002" value="0.002" /></label>
+          <label title="Number of full passes through the training dataset">Epochs <input id="epochsInput" type="number" min="1" max="200" value="30" /></label>
         </div>
         <div class="controls">
-          <button id="downloadBtn" disabled>Download model</button>
-          <button id="uploadBtn">Upload model</button>
+          <button id="downloadBtn" disabled title="Save trained model weights and architecture to a JSON file for use on the inference page">Download model</button>
+          <button id="uploadBtn" title="Load previously saved model weights from a JSON file">Upload model</button>
         </div>
 
         <h2>Map preview <span id="selectedMapLabel" style="font-weight:normal;color:#64748b">(click thumbnail to select)</span></h2>
-        <canvas id="mapCanvas" width="400" height="300"></canvas>
+        <canvas id="mapCanvas" width="400" height="300" title="Click anywhere to test inference at that location (random scale)"></canvas>
         <p class="status" id="status">Load at least one map and click "Build dataset" to start.</p>
       </section>
 
@@ -263,53 +286,67 @@
         card.dataset.index = index;
 
         // Thumbnail
+        // Scale thumbnail to a reasonable resolution (up to 320px on the long side)
+        const MAX_THUMB = 320;
+        const thumbScale = Math.min(1, MAX_THUMB / Math.max(entry.bitmap.width, entry.bitmap.height));
         const thumb = document.createElement('canvas');
-        thumb.width = 72; thumb.height = 72;
-        thumb.getContext('2d').drawImage(entry.bitmap, 0, 0, 72, 72);
+        thumb.width  = Math.round(entry.bitmap.width  * thumbScale);
+        thumb.height = Math.round(entry.bitmap.height * thumbScale);
+        thumb.getContext('2d').drawImage(entry.bitmap, 0, 0, thumb.width, thumb.height);
         if (index === selectedIndex) thumb.classList.add('selected');
+        thumb.title = 'Click to select this map for preview and prediction testing';
         thumb.addEventListener('click', () => selectMap(index));
-        card.appendChild(thumb);
 
-        // Bounds + label
-        const right = document.createElement('div');
-        right.style.flex = '1';
-
-        const boundsDiv = document.createElement('div');
-        boundsDiv.className = 'bounds';
-
-        const fields = [
-          { key: 'latMin', label: 'Lat min' },
-          { key: 'latMax', label: 'Lat max' },
-          { key: 'lonMin', label: 'Lon min' },
-          { key: 'lonMax', label: 'Lon max' },
-        ];
-        for (const { key, label } of fields) {
+        // Coordinate bound inputs
+        function makeBoundsInput(key, tooltipText) {
           const inp = document.createElement('input');
           inp.type = 'number'; inp.step = 'any';
+          inp.className = 'bounds-input';
           inp.value = entry.bounds[key];
-          inp.placeholder = label;
-          inp.style.width = '100%';
+          inp.title = tooltipText;
           inp.addEventListener('input', () => {
             const v = parseFloat(inp.value);
             if (!Number.isFinite(v)) return;
             entry.bounds[key] = v;
-            trainBtn.disabled = true;  // stale dataset
+            trainBtn.disabled = true;
             dataset = null;
           });
-          boundsDiv.appendChild(inp);
+          return inp;
         }
-        right.appendChild(boundsDiv);
 
+        // Top ruler: lon-min (left) and lon-max (right)
+        const topRuler = document.createElement('div');
+        topRuler.className = 'map-top-ruler';
+        topRuler.appendChild(makeBoundsInput('lonMin', 'Western longitude bound — left edge of map (degrees, e.g. −5)'));
+        topRuler.appendChild(makeBoundsInput('lonMax', 'Eastern longitude bound — right edge of map (degrees, e.g. 15)'));
+        card.appendChild(topRuler);
+
+        // Middle row: lat ruler + canvas
+        const mapRow = document.createElement('div');
+        mapRow.className = 'map-row';
+
+        const latRuler = document.createElement('div');
+        latRuler.className = 'map-lat-ruler';
+        latRuler.appendChild(makeBoundsInput('latMax', 'Northern latitude bound — top edge of map (degrees, e.g. 45)'));
+        latRuler.appendChild(makeBoundsInput('latMin', 'Southern latitude bound — bottom edge of map (degrees, e.g. 40)'));
+
+        mapRow.appendChild(latRuler);
+        mapRow.appendChild(thumb);
+        card.appendChild(mapRow);
+
+        // Footer with label and remove button
         const footer = document.createElement('div');
         footer.className = 'entry-footer';
-        footer.textContent = entry.label + ' ';
+        const labelSpan = document.createElement('span');
+        labelSpan.textContent = entry.label;
+        footer.appendChild(labelSpan);
         const removeBtn = document.createElement('button');
         removeBtn.textContent = 'Remove';
+        removeBtn.title = 'Remove this map from the training set';
         removeBtn.addEventListener('click', () => removeMapEntry(index));
         footer.appendChild(removeBtn);
-        right.appendChild(footer);
+        card.appendChild(footer);
 
-        card.appendChild(right);
         mapList.appendChild(card);
       }
 

@@ -22,7 +22,7 @@ export function generateMap(width, height, nRegions) {
     color: hsvToRgb(index / nRegions, 0.65, 0.92),
   }));
   const imageData = new Uint8ClampedArray(width * height * 4);
-  const regionMask = new Uint8Array(width * height);
+  const regionMask = new Uint16Array(width * height);
 
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
@@ -88,7 +88,7 @@ export function assignRegionsByGrid(width, height, nRegions) {
   }
   const gridCols = bestCols;
   const gridRows = nRegions / gridCols;
-  const regionMask = new Uint8Array(width * height);
+  const regionMask = new Uint16Array(width * height);
   for (let y = 0; y < height; y += 1) {
     const row = Math.min(gridRows - 1, Math.floor((y * gridRows) / height));
     for (let x = 0; x < width; x += 1) {
@@ -116,10 +116,15 @@ export function generateGridTrainingPatches(imageData, width, height, gridCols, 
       const xMax = Math.floor((col + 1) * cellW) - half;
       const yMin = Math.ceil(row * cellH) + half;
       const yMax = Math.floor((row + 1) * cellH) - half;
-      if (xMax <= xMin || yMax <= yMin) continue;
+      // When the cell is narrower/shorter than the patch, fall back to the
+      // cell centre. extractPatch clamps to image boundaries so this is safe.
+      const sampleXMin = xMax > xMin ? xMin : Math.round((col + 0.5) * cellW);
+      const sampleXMax = xMax > xMin ? xMax : sampleXMin + 1;
+      const sampleYMin = yMax > yMin ? yMin : Math.round((row + 0.5) * cellH);
+      const sampleYMax = yMax > yMin ? yMax : sampleYMin + 1;
       for (let sample = 0; sample < patchesPerRegion; sample += 1) {
-        const x = xMin + Math.floor(Math.random() * (xMax - xMin));
-        const y = yMin + Math.floor(Math.random() * (yMax - yMin));
+        const x = sampleXMin + Math.floor(Math.random() * (sampleXMax - sampleXMin));
+        const y = sampleYMin + Math.floor(Math.random() * (sampleYMax - sampleYMin));
         const patch = extractPatch(imageData, width, x, y, patchSize);
         const jitter = 1 + (Math.random() * 0.16 - 0.08);
         for (let index = 0; index < patch.length; index += 1) {

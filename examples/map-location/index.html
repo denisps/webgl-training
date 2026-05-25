@@ -105,6 +105,8 @@
       let trainer;
       let lossHistory = [];
       let stopRequested = false;
+      // null = procedural map; set to { bitmap, width, height, imageData } when a file is loaded
+      let mapSource = null;
 
       // Scale patchesPerRegion with the square root of image area so larger
       // maps get proportionally more training samples, capped for performance.
@@ -260,44 +262,55 @@
         });
       }
 
-      function initFromGeneratedMap() {
-        const nRegions = Number(regionsInput.value);
-        mapWidth = DEFAULT_MAP_SIZE;
-        mapHeight = DEFAULT_MAP_SIZE;
-        mapState = generateMap(mapWidth, mapHeight, nRegions);
-        const samples = computePatchesPerRegion();
-        dataset = createDataset(...Object.values(
-          generateTrainingPatches(mapState.imageData, mapState.regionMask, mapWidth, mapHeight, REGION_SIZE, samples)
-        ));
-        resetModel(nRegions);
-        lossHistory = [];
-        epochLabel.textContent = 'Epoch: 0';
-        statusLabel.textContent = `Dataset: ${dataset.size} samples across ${nRegions} regions.`;
-        predictionLabel.textContent = 'Click the map to test a patch.';
+      // Recompute region assignment and training dataset from the current map
+      // source (image file or procedural). Called whenever the image, the region
+      // count, or the loaded model changes.
+      function rebuildRegions(nRegions) {
+        regionsInput.value = nRegions;
+        if (mapSource) {
+          mapWidth = mapSource.width;
+          mapHeight = mapSource.height;
+          const { regionMask, gridCols, gridRows } = assignRegionsByGrid(mapWidth, mapHeight, nRegions);
+          mapState = { imageData: mapSource.imageData, bitmap: mapSource.bitmap, regionMask, gridCols, gridRows };
+          const samples = computePatchesPerRegion();
+          dataset = createDataset(...Object.values(
+            generateGridTrainingPatches(mapSource.imageData, mapWidth, mapHeight, gridCols, gridRows, REGION_SIZE, samples)
+          ));
+          statusLabel.textContent = `Image: ${mapWidth}\u00d7${mapHeight}px (${gridCols}\u00d7${gridRows} regions) | ${dataset.size} samples.`;
+        } else {
+          mapWidth = DEFAULT_MAP_SIZE;
+          mapHeight = DEFAULT_MAP_SIZE;
+          mapState = generateMap(mapWidth, mapHeight, nRegions);
+          const samples = computePatchesPerRegion();
+          dataset = createDataset(...Object.values(
+            generateTrainingPatches(mapState.imageData, mapState.regionMask, mapWidth, mapHeight, REGION_SIZE, samples)
+          ));
+          statusLabel.textContent = `Dataset: ${dataset.size} samples across ${nRegions} regions.`;
+        }
         resizeMapCanvas();
         renderMap();
         drawLoss();
       }
 
-      async function initFromImageFile(file) {
+      function initFromGeneratedMap() {
+        mapSource = null;
         const nRegions = Number(regionsInput.value);
-        const { bitmap, width, height, imageData } = await loadImageFromFile(file);
-        mapWidth = width;
-        mapHeight = height;
-        const { regionMask, gridCols, gridRows } = assignRegionsByGrid(width, height, nRegions);
-        mapState = { imageData, regionMask, bitmap, gridCols, gridRows };
-        const samples = computePatchesPerRegion();
-        dataset = createDataset(...Object.values(
-          generateGridTrainingPatches(imageData, width, height, gridCols, gridRows, REGION_SIZE, samples)
-        ));
-        resetModel(nRegions);
         lossHistory = [];
+        rebuildRegions(nRegions);
+        resetModel(nRegions);
         epochLabel.textContent = 'Epoch: 0';
-        statusLabel.textContent = `Image: ${width}×${height}px (${gridCols}×${gridRows} regions) | ${dataset.size} samples.`;
         predictionLabel.textContent = 'Click the map to test a patch.';
-        resizeMapCanvas();
-        renderMap();
-        drawLoss();
+      }
+
+      async function initFromImageFile(file) {
+        const { bitmap, width, height, imageData } = await loadImageFromFile(file);
+        mapSource = { bitmap, width, height, imageData };
+        const nRegions = Number(regionsInput.value);
+        lossHistory = [];
+        rebuildRegions(nRegions);
+        resetModel(nRegions);
+        epochLabel.textContent = 'Epoch: 0';
+        predictionLabel.textContent = 'Click the map to test a patch.';
       }
 
       async function train() {
@@ -340,6 +353,38 @@
         return `hsl(${Math.round((regionIndex / nRegions) * 360)}, 65%, 55%)`;
       }
 
+      // Tint every pixel belonging to the predicted and truth regions on the map
+      // canvas so the user can see where each region is located.
+      // Predicted (wrong): blue; ground truth (when wrong): green; correct: gold.
+      function drawRegionHighlight(predictedIndex, truthIndex) {
+        const nPixels = mapWidth * mapHeight;
+        const overlay = document.createElement('canvas');
+        overlay.width = mapWidth;
+        overlay.height = mapHeight;
+        const octx = overlay.getContext('2d');
+        const imgData = octx.createImageData(mapWidth, mapHeight);
+        const same = predictedIndex === truthIndex;
+        for (let i = 0; i < nPixels; i += 1) {
+          const region = mapState.regionMask[i];
+          let r = 0; let g = 0; let b = 0; let a = 0;
+          if (same && region === truthIndex) {
+            r = 234; g = 179; b = 8; a = 150;        // gold — correct
+          } else if (!same && region === predictedIndex) {
+            r = 59; g = 130; b = 246; a = 150;        // blue — wrong prediction
+          } else if (!same && region === truthIndex) {
+            r = 34; g = 197; b = 94; a = 150;         // green — ground truth
+          }
+          if (a > 0) {
+            imgData.data[i * 4 + 0] = r;
+            imgData.data[i * 4 + 1] = g;
+            imgData.data[i * 4 + 2] = b;
+            imgData.data[i * 4 + 3] = a;
+          }
+        }
+        octx.putImageData(imgData, 0, 0);
+        mapCanvas.getContext('2d').drawImage(overlay, 0, 0, mapCanvas.width, mapCanvas.height);
+      }
+
       async function predictAt(x, y) {
         const patch = extractPatch(mapState.imageData, mapWidth, x, y, REGION_SIZE);
         renderPatch(patch);
@@ -359,6 +404,8 @@
         predictionLabel.innerHTML =
           `${swatch(regionColor(bestIndex, nRegions))}Predicted: region ${bestIndex}&nbsp;&nbsp;&nbsp;` +
           `${swatch(regionColor(truth, nRegions))}Ground truth: region ${truth}&nbsp;&nbsp;${match}`;
+        renderMap();
+        drawRegionHighlight(bestIndex, truth);
       }
 
       mapCanvas.addEventListener('click', (event) => {
@@ -395,22 +442,28 @@
         if (!parsed) return;
         try {
           if (parsed.architecture) {
-            const arch = parsed.architecture;
-            if (arch.regionSize && arch.regionSize !== REGION_SIZE) {
-              statusLabel.textContent = `Warning: file trained with regionSize=${arch.regionSize}, current is ${REGION_SIZE}. Weights loaded anyway.`;
-            }
-            if (arch.nRegions !== model.architecture.nRegions) {
-              resetModel(arch.nRegions);
-              regionsInput.value = arch.nRegions;
-            }
+            rebuildRegions(parsed.architecture.nRegions);
+            resetModel(parsed.architecture.nRegions);
           }
           loadModelWeights(gl, model, parsed);
-          if (!parsed.architecture || parsed.architecture.regionSize === REGION_SIZE) {
-            statusLabel.textContent = 'Weights loaded.';
+          const arch = parsed.architecture;
+          let message = `Weights loaded (${model.architecture.nRegions} regions).`;
+          if (arch?.regionSize && arch.regionSize !== REGION_SIZE) {
+            message += ` Note: file was trained with regionSize=${arch.regionSize}, current build uses ${REGION_SIZE}.`;
           }
+          statusLabel.textContent = message;
         } catch (error) {
           statusLabel.textContent = `Error loading weights: ${error.message}`;
         }
+      });
+
+      regionsInput.addEventListener('change', () => {
+        const nRegions = Number(regionsInput.value);
+        lossHistory = [];
+        rebuildRegions(nRegions);
+        resetModel(nRegions);
+        epochLabel.textContent = 'Epoch: 0';
+        predictionLabel.textContent = 'Click the map to test a patch.';
       });
 
       initFromGeneratedMap();

@@ -25,29 +25,43 @@ export function createWebGL2Context(canvas) {
   gl.disable(gl.CULL_FACE);
   gl.disable(gl.DEPTH_TEST);
   gl.disable(gl.DITHER);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
   return gl;
 }
 
+// Texture pool: avoids gl.texImage2D allocation + DMA zero-init on every pass.
+// Keyed by WebGL context so multiple contexts don't share textures.
+const contextPools = new WeakMap();
+
+function getPool(gl) {
+  if (!contextPools.has(gl)) contextPools.set(gl, new Map());
+  return contextPools.get(gl);
+}
+
 export function createTensor(gl, rows, cols, data) {
-  const texture = gl.createTexture();
-  gl.bindTexture(gl.TEXTURE_2D, texture);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-  gl.texImage2D(
-    gl.TEXTURE_2D,
-    0,
-    gl.R32F,
-    cols,
-    rows,
-    0,
-    gl.RED,
-    gl.FLOAT,
-    data ?? null,
-  );
-  gl.bindTexture(gl.TEXTURE_2D, null);
+  const pool = getPool(gl);
+  const key = `${rows}x${cols}`;
+  const available = pool.get(key);
+  let texture = (available && available.length > 0) ? available.pop() : null;
+
+  if (texture === null) {
+    // First use of this size: allocate GPU storage.
+    texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, cols, rows, 0, gl.RED, gl.FLOAT, data ?? null);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+  } else if (data !== undefined && data !== null) {
+    // Pooled texture with uploaded data: reuse storage, skip reallocation.
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, cols, rows, gl.RED, gl.FLOAT, data);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+  }
+  // Pooled texture without data: content will be overwritten by the next render pass.
+
   return { texture, rows, cols };
 }
 
@@ -93,7 +107,9 @@ export function readTensor(gl, tensor) {
 }
 
 export function destroyTensor(gl, tensor) {
-  if (tensor?.texture) {
-    gl.deleteTexture(tensor.texture);
-  }
+  if (!tensor?.texture) return;
+  const pool = getPool(gl);
+  const key = `${tensor.rows}x${tensor.cols}`;
+  if (!pool.has(key)) pool.set(key, []);
+  pool.get(key).push(tensor.texture);
 }

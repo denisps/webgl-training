@@ -98,16 +98,20 @@ function setUniform(gl, location, value, textureUnit, type) {
   throw new Error('Unsupported uniform value.');
 }
 
+// One framebuffer per WebGL context, reattached to different textures each pass.
+const contextFramebuffers = new WeakMap();
+
+function getSharedFramebuffer(gl) {
+  if (!contextFramebuffers.has(gl)) {
+    contextFramebuffers.set(gl, gl.createFramebuffer());
+  }
+  return contextFramebuffers.get(gl);
+}
+
 export function executePass(gl, program, uniforms, outputTensor, quadBuffer) {
-  const framebuffer = gl.createFramebuffer();
+  const framebuffer = getSharedFramebuffer(gl);
   gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
   gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, outputTensor.texture, 0);
-  const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
-  if (status !== gl.FRAMEBUFFER_COMPLETE) {
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.deleteFramebuffer(framebuffer);
-    throw new Error(`Framebuffer incomplete: ${status}`);
-  }
   gl.viewport(0, 0, outputTensor.cols, outputTensor.rows);
   gl.useProgram(program);
   gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
@@ -127,5 +131,4 @@ export function executePass(gl, program, uniforms, outputTensor, quadBuffer) {
   gl.disableVertexAttribArray(0);
   gl.bindBuffer(gl.ARRAY_BUFFER, null);
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  gl.deleteFramebuffer(framebuffer);
 }

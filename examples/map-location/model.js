@@ -3,14 +3,15 @@ import { denseBwd, denseFwd, createDenseWeights } from '../../src/layers/dense.j
 import { createTransformerWeights, batchedTransformerFwd, batchedTransformerBwd, destroyTransformerCache } from '../../src/layers/transformer.js';
 import { patchify, unpatchify, meanPool, meanPoolBwd } from '../../src/ops/patch.js';
 
-// ViT-style architecture: split each 32×32×3 patch into 4×4=16 spatial tokens
-// of 8×8×3=192 features each, project to dModel, run a transformer block, then
-// average-pool the tokens before the classification head.
+// ViT-style architecture: split each REGION_SIZE×REGION_SIZE×3 patch into
+// (REGION_SIZE/PATCH_SIDE)² spatial tokens of PATCH_SIDE²×3 features each,
+// project to D_MODEL, run a transformer block, then average-pool before the head.
+// Change REGION_SIZE (must be a multiple of PATCH_SIDE) to use larger input crops.
+export const REGION_SIZE = 64;
 const PATCH_SIDE = 8;
-const IMAGE_SIDE = 32;
 const CHANNELS = 3;
-const SEQ_LEN = (IMAGE_SIDE / PATCH_SIDE) ** 2;   // 16 tokens
-const GRID_COLS = IMAGE_SIDE / PATCH_SIDE;          // 4
+const SEQ_LEN = (REGION_SIZE / PATCH_SIDE) ** 2;   // 64 tokens for 64×64
+const GRID_COLS = REGION_SIZE / PATCH_SIDE;          // 8 for 64×64
 const TOKEN_DIM = PATCH_SIDE * PATCH_SIDE * CHANNELS; // 192
 const D_MODEL = 128;
 const N_HEADS = 4;
@@ -27,9 +28,9 @@ function flattenWeights(weights) {
 }
 
 export function mapModelFwd(gl, programs, input, weights) {
-  // 1. Split each sample into spatial tokens: [batch, 3072] -> [batch*16, 192]
-  const patched = patchify(gl, programs, input, SEQ_LEN, GRID_COLS, PATCH_SIDE, IMAGE_SIDE, CHANNELS);
-  // 2. Shared linear projection for all tokens: -> [batch*16, 128]
+  // 1. Split each sample into spatial tokens: [batch, inputSize] -> [batch*SEQ_LEN, TOKEN_DIM]
+  const patched = patchify(gl, programs, input, SEQ_LEN, GRID_COLS, PATCH_SIDE, REGION_SIZE, CHANNELS);
+  // 2. Shared linear projection for all tokens: -> [batch*SEQ_LEN, D_MODEL]
   const embedded = denseFwd(gl, programs, patched, weights.embed, 'linear');
   // 3. Transformer block with per-sample block-diagonal attention: -> [batch*16, 128]
   const txOut = batchedTransformerFwd(gl, programs, embedded.output, weights.tx, SEQ_LEN, N_HEADS);
@@ -51,7 +52,7 @@ export function mapModelBwd(gl, programs, input, weights, cache, dOutput) {
   destroyTensor(gl, dTxOut);
   const gEmbed = denseBwd(gl, programs, cache.patched, weights.embed, cache.embedded.preActivation, gTx.dInput, 'linear');
   destroyTensor(gl, gTx.dInput);
-  const dInput = unpatchify(gl, programs, gEmbed.dInput, SEQ_LEN, GRID_COLS, PATCH_SIDE, IMAGE_SIDE, CHANNELS);
+  const dInput = unpatchify(gl, programs, gEmbed.dInput, SEQ_LEN, GRID_COLS, PATCH_SIDE, REGION_SIZE, CHANNELS);
   destroyTensor(gl, gEmbed.dInput);
   return {
     dInput,
@@ -73,7 +74,7 @@ export function createMapModel(gl, nRegions = 8) {
   };
   return {
     type: 'patch-transformer',
-    inputSize: IMAGE_SIDE * IMAGE_SIDE * CHANNELS,
+    inputSize: REGION_SIZE * REGION_SIZE * CHANNELS,
     weights,
     parameters: flattenWeights(weights),
     architecture: {

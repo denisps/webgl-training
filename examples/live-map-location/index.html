@@ -72,7 +72,7 @@
         <div id="mapList"></div>
         <div class="controls">
           <button id="addProceduralBtn" title="Add a synthetically generated Voronoi colour map (useful for quick testing without real imagery)">Add procedural map</button>
-          <button id="addImageBtn" title="Load a real map image from disk and assign geographic bounds to it">Add image…</button>
+          <button id="addImageBtn" title="Load a map image from disk. Bounds are auto-detected if the filename follows the pattern: name_west_north_east_south.png">Add image…</button>
         </div>
 
         <h2>Dataset &amp; Training</h2>
@@ -500,6 +500,21 @@
         status.textContent = `Added procedural map. Rebuild the dataset to include it.`;
       });
 
+      // Parse geographic bounds from a filename of the form:
+      //   <name>_<west>_<north>_<east>_<south>.<ext>
+      // The last four underscore-separated tokens before the extension are treated as
+      // lonMin (west), latMax (north), lonMax (east), latMin (south).
+      // Returns null when the filename does not match the pattern.
+      function parseBoundsFromFilename(filename) {
+        const withoutExt = filename.replace(/\.[^.]+$/, '');
+        const parts = withoutExt.split('_');
+        if (parts.length < 5) return null;  // need at least <name> + 4 coords
+        const [west, north, east, south] = parts.slice(-4).map(Number);
+        if ([west, north, east, south].some((v) => !Number.isFinite(v))) return null;
+        if (east <= west || north <= south) return null;
+        return { lonMin: west, latMax: north, lonMax: east, latMin: south };
+      }
+
       document.getElementById('addImageBtn').addEventListener('click', () => {
         const input = document.createElement('input');
         input.type = 'file'; input.accept = 'image/*';
@@ -507,12 +522,12 @@
           const [file] = input.files || [];
           if (!file) return;
           const bitmap = await createImageBitmap(file);
-          const defaultBounds = { latMin: 40, latMax: 45, lonMin: 10, lonMax: 15 };
-          addMapEntry({
-            bitmap, width: bitmap.width, height: bitmap.height,
-            bounds: defaultBounds, label: file.name,
-          });
-          status.textContent = `Loaded "${file.name}". Edit lat/lon bounds, then rebuild dataset.`;
+          const parsed = parseBoundsFromFilename(file.name);
+          const bounds = parsed ?? { latMin: 40, latMax: 45, lonMin: 10, lonMax: 15 };
+          addMapEntry({ bitmap, width: bitmap.width, height: bitmap.height, bounds, label: file.name });
+          status.textContent = parsed
+            ? `Loaded "${file.name}" — bounds detected from filename (W:${parsed.lonMin} N:${parsed.latMax} E:${parsed.lonMax} S:${parsed.latMin}).`
+            : `Loaded "${file.name}". Edit lat/lon bounds in the card, then rebuild the dataset.`;
         };
         input.click();
       });

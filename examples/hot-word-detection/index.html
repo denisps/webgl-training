@@ -87,7 +87,11 @@
           <h2>1. Record Hotword Samples</h2>
           <label>Hotword name<input id="hotwordName" type="text" value="hey-computer" /></label>
           <p class="hint">Record 4–10 clear pronunciations. Each capture is 1.5 s.</p>
-          <button id="recordBtn">⏺ Record sample</button>
+          <div class="row">
+            <button id="recordBtn">⏺ Record sample</button>
+            <button id="saveSamplesBtn" disabled>Save samples</button>
+            <button id="loadSamplesBtn">Load samples</button>
+          </div>
           <p class="status" id="recordStatus">0 samples recorded.</p>
           <canvas id="waveCanvas" width="242" height="56"></canvas>
           <div id="sampleList"></div>
@@ -230,6 +234,8 @@
       // ── DOM refs ───────────────────────────────────────────────────────────
       const hotwordNameInput  = document.getElementById('hotwordName');
       const recordBtn         = document.getElementById('recordBtn');
+      const saveSamplesBtn    = document.getElementById('saveSamplesBtn');
+      const loadSamplesBtn    = document.getElementById('loadSamplesBtn');
       const recordStatus      = document.getElementById('recordStatus');
       const waveCanvas        = document.getElementById('waveCanvas');
       const sampleListEl      = document.getElementById('sampleList');
@@ -264,8 +270,13 @@
         startBtn.disabled   = reference === null || detectionActive;
         stopBtn.disabled    = !detectionActive;
         // Disable recording buttons while detection is running (mic handler would conflict)
-        recordBtn.disabled    = detectionActive;
-        recordBgBtn.disabled  = detectionActive;
+        recordBtn.disabled       = detectionActive;
+        recordBgBtn.disabled     = detectionActive;
+        saveSamplesBtn.disabled  = detectionActive || n === 0;
+      }
+
+      function updateSampleStatus() {
+        const n = hotwordAudioSamples.length;
         recordStatus.textContent = `${n} sample${n !== 1 ? 's' : ''} recorded.`;
       }
 
@@ -305,6 +316,7 @@
           hotwordAudioSamples.splice(index, 1);
           sampleListEl.innerHTML = '';
           hotwordAudioSamples.forEach((a, i) => addSampleThumbnail(a, i));
+          updateSampleStatus();
           updateButtonStates();
         };
         div.appendChild(cvs);
@@ -392,14 +404,54 @@
           drawWaveform(waveCanvas, audio);
           sampleListEl.innerHTML = '';
           hotwordAudioSamples.forEach((a, i) => addSampleThumbnail(a, i));
+          updateSampleStatus();
         } catch (err) {
           recordStatus.textContent = `Error: ${err.message}`;
         } finally {
           isRecording = false;
-          recordBtn.disabled = false;
           recordBtn.textContent = '⏺ Record sample';
           updateButtonStates();
         }
+      });
+
+      saveSamplesBtn.addEventListener('click', () => {
+        const hotword = hotwordNameInput.value.trim() || 'hotword';
+        const payload = {
+          version: 1,
+          hotword,
+          samples: hotwordAudioSamples.map((a) => Array.from(a)),
+        };
+        const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${hotword}_samples.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+      });
+
+      loadSamplesBtn.addEventListener('click', () => {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = '.json,application/json';
+        input.onchange = async () => {
+          const file = input.files?.[0];
+          if (!file) return;
+          try {
+            const data = JSON.parse(await file.text());
+            if (!Array.isArray(data.samples)) throw new Error('Invalid samples file.');
+            hotwordAudioSamples = data.samples.map((s) => new Float32Array(s));
+            if (data.hotword) hotwordNameInput.value = data.hotword;
+            sampleListEl.innerHTML = '';
+            hotwordAudioSamples.forEach((a, i) => addSampleThumbnail(a, i));
+            if (hotwordAudioSamples.length > 0) drawWaveform(waveCanvas, hotwordAudioSamples[hotwordAudioSamples.length - 1]);
+            updateSampleStatus();
+            updateButtonStates();
+          } catch (err) {
+            recordStatus.textContent = `Error loading samples: ${err.message}`;
+          }
+        };
+        input.click();
       });
 
       // ── Phase 2: Background audio ──────────────────────────────────────────

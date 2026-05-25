@@ -1,0 +1,437 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Live Map Location – Inference</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { font-family: system-ui, sans-serif; margin: 0; background: #0f172a; color: #e2e8f0; }
+      header { padding: 0.75rem 1.25rem; border-bottom: 1px solid #1e293b; display: flex; align-items: baseline; gap: 1.5rem; }
+      header h1 { margin: 0; font-size: 1.1rem; }
+      header a { color: #38bdf8; font-size: 0.9rem; }
+
+      /* Two-column layout: map takes the space, sidebar is fixed */
+      .layout { display: flex; height: calc(100vh - 53px); overflow: hidden; }
+      #mapWrap {
+        flex: 1; overflow: auto; display: flex; align-items: flex-start; justify-content: flex-start;
+        background: #020617; padding: 0.5rem;
+      }
+      #mapCanvas { display: block; image-rendering: pixelated; cursor: crosshair; }
+
+      aside {
+        width: 260px; min-width: 240px; flex-shrink: 0;
+        background: #111827; border-left: 1px solid #1f2937;
+        overflow-y: auto; padding: 0.75rem;
+        display: flex; flex-direction: column; gap: 0.75rem;
+      }
+
+      h2 { margin: 0 0 0.4rem; font-size: 0.85rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; }
+      button, input, select { background: #1e293b; color: #e2e8f0; border: 1px solid #334155; border-radius: 0.4rem; padding: 0.35rem 0.6rem; width: 100%; }
+      button { cursor: pointer; }
+      button:disabled { opacity: 0.45; cursor: default; }
+      input[type="number"] { width: 100%; }
+      .row { display: flex; gap: 0.5rem; }
+      .row button, .row input { flex: 1; }
+      label { font-size: 0.85rem; display: flex; flex-direction: column; gap: 0.2rem; }
+      .bounds-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.35rem; }
+
+      .panel { background: #0f172a; border: 1px solid #1f2937; border-radius: 0.5rem; padding: 0.6rem; }
+
+      /* Camera preview */
+      #camWrap { position: relative; }
+      #camVideo { width: 100%; border-radius: 0.375rem; background: #020617; display: block; }
+      #patchCanvas { width: 100%; border-radius: 0.375rem; background: #020617; display: block; margin-top: 0.4rem; image-rendering: pixelated; }
+
+      .stat { font-size: 0.9rem; line-height: 1.7; color: #e2e8f0; }
+      .stat b { color: #38bdf8; }
+      .status { color: #94a3b8; font-size: 0.8rem; min-height: 1.1em; }
+
+      .compass-row { display: flex; gap: 0.4rem; align-items: center; font-size: 0.85rem; }
+      #compassDisplay { font-weight: bold; color: #38bdf8; min-width: 2rem; text-align: right; }
+      #bearingInput { flex: 1; }
+      #compassMode { font-size: 0.75rem; color: #64748b; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Live Map Location – Inference</h1>
+      <a href="index.html">← Training</a>
+      <a href="/">Index</a>
+    </header>
+
+    <div class="layout">
+      <!-- Map display -->
+      <div id="mapWrap">
+        <canvas id="mapCanvas"></canvas>
+      </div>
+
+      <!-- Control sidebar -->
+      <aside>
+        <!-- Model -->
+        <div class="panel">
+          <h2>Model</h2>
+          <button id="loadModelBtn">Load model…</button>
+          <p class="status" id="modelStatus">No model loaded.</p>
+        </div>
+
+        <!-- Map image + bounds -->
+        <div class="panel">
+          <h2>Map image</h2>
+          <button id="loadMapBtn">Load map image…</button>
+          <div class="bounds-grid" style="margin-top:0.5rem">
+            <label>Lat min<input id="latMinInput" type="number" step="any" value="40" /></label>
+            <label>Lat max<input id="latMaxInput" type="number" step="any" value="45" /></label>
+            <label>Lon min<input id="lonMinInput" type="number" step="any" value="10" /></label>
+            <label>Lon max<input id="lonMaxInput" type="number" step="any" value="15" /></label>
+          </div>
+          <p class="status" id="mapStatus">No map loaded.</p>
+        </div>
+
+        <!-- Camera -->
+        <div class="panel">
+          <h2>Camera</h2>
+          <div class="row">
+            <button id="startCamBtn">Start camera</button>
+            <button id="stopCamBtn" disabled>Stop</button>
+          </div>
+          <div id="camWrap" style="margin-top:0.5rem">
+            <video id="camVideo" autoplay playsinline muted></video>
+          </div>
+          <p class="status" id="camStatus">Camera inactive.</p>
+        </div>
+
+        <!-- Compass / bearing -->
+        <div class="panel">
+          <h2>Compass (north-up rotation)</h2>
+          <div class="compass-row">
+            <span>Heading:</span>
+            <span id="compassDisplay">0°</span>
+            <span id="compassMode">manual</span>
+          </div>
+          <label style="margin-top:0.4rem">
+            Manual bearing (°)
+            <input id="bearingInput" type="number" step="1" value="0" min="0" max="359" />
+          </label>
+          <p class="status" style="margin-top:0.3rem">
+            On mobile, grant motion permission for automatic compass.
+          </p>
+          <button id="requestOrientationBtn" style="margin-top:0.3rem;width:100%">Enable device compass</button>
+        </div>
+
+        <!-- Patch extracted from camera -->
+        <div class="panel">
+          <h2>Extracted patch</h2>
+          <canvas id="patchCanvas" width="64" height="64"></canvas>
+        </div>
+
+        <!-- Predictions -->
+        <div class="panel">
+          <h2>Prediction</h2>
+          <div class="stat" id="predStat">–</div>
+          <p class="status" id="inferStatus">Waiting for model &amp; camera.</p>
+        </div>
+      </aside>
+    </div>
+
+    <script type="module">
+      import { createWebGL2Context } from '../../src/webgl/context.js';
+      import { buildProgramCache } from '../../src/webgl/program.js';
+      import { MATMUL_SHADERS } from '../../src/ops/matmul.js';
+      import { ELEMENTWISE_SHADERS } from '../../src/ops/elementwise.js';
+      import { REDUCE_SHADERS } from '../../src/ops/reduce.js';
+      import { NORM_SHADERS } from '../../src/ops/norm.js';
+      import { ATTENTION_SHADERS } from '../../src/ops/attention.js';
+      import { PATCH_SHADERS } from '../../src/ops/patch.js';
+      import { TRANSFORMER_SHADERS } from '../../src/layers/transformer.js';
+      import { LOSS_SHADERS } from '../../src/training/loss.js';
+      import { OPTIMIZER_SHADERS } from '../../src/training/optimizer.js';
+      import { loadWeightsFromFile } from '../../src/utils/serialize.js';
+      import { loadModelWeights } from '../../src/inference/model.js';
+      import { runBatchInference } from '../../src/inference/runner.js';
+      import { extractTransformedPatch, decodePrediction, latLonToPixel } from './mapgen.js';
+      import { createGeoRegressionModel, REGION_SIZE } from './model.js';
+
+      const shaderSources = {
+        ...MATMUL_SHADERS, ...ELEMENTWISE_SHADERS, ...REDUCE_SHADERS,
+        ...NORM_SHADERS, ...ATTENTION_SHADERS, ...PATCH_SHADERS,
+        ...TRANSFORMER_SHADERS, ...LOSS_SHADERS, ...OPTIMIZER_SHADERS,
+      };
+
+      const gl = createWebGL2Context(document.createElement('canvas'));
+      const programs = buildProgramCache(gl, shaderSources);
+
+      // DOM refs
+      const mapCanvas      = document.getElementById('mapCanvas');
+      const camVideo       = document.getElementById('camVideo');
+      const patchCanvas    = document.getElementById('patchCanvas');
+      const modelStatus    = document.getElementById('modelStatus');
+      const mapStatus      = document.getElementById('mapStatus');
+      const camStatus      = document.getElementById('camStatus');
+      const inferStatus    = document.getElementById('inferStatus');
+      const predStat       = document.getElementById('predStat');
+      const compassDisplay = document.getElementById('compassDisplay');
+      const compassMode    = document.getElementById('compassMode');
+      const bearingInput   = document.getElementById('bearingInput');
+      const latMinInput    = document.getElementById('latMinInput');
+      const latMaxInput    = document.getElementById('latMaxInput');
+      const lonMinInput    = document.getElementById('lonMinInput');
+      const lonMaxInput    = document.getElementById('lonMaxInput');
+
+      // State
+      let model = null;
+      let mapBitmap = null;         // loaded map image
+      let mapBounds = null;         // { latMin, latMax, lonMin, lonMax }
+      let compassHeading = 0;       // degrees clockwise from north
+      let orientationAuto = false;
+      let inferenceActive = false;
+      let camStream = null;
+      let lastInferenceMs = 0;
+      const INFERENCE_INTERVAL_MS = 200;  // throttle to ~5 fps for performance
+
+      // Shared patch extraction canvas (reused every frame)
+      const _patchCanvas = document.createElement('canvas');
+      _patchCanvas.width = REGION_SIZE; _patchCanvas.height = REGION_SIZE;
+
+      // ── Bounds helpers ─────────────────────────────────────────────────────
+      function readBounds() {
+        return {
+          latMin: parseFloat(latMinInput.value),
+          latMax: parseFloat(latMaxInput.value),
+          lonMin: parseFloat(lonMinInput.value),
+          lonMax: parseFloat(lonMaxInput.value),
+        };
+      }
+
+      function boundsValid(b) {
+        return Number.isFinite(b.latMin) && Number.isFinite(b.latMax) &&
+               Number.isFinite(b.lonMin) && Number.isFinite(b.lonMax) &&
+               b.latMax > b.latMin && b.lonMax > b.lonMin;
+      }
+
+      // ── Map rendering ──────────────────────────────────────────────────────
+
+      function renderMapBase() {
+        if (!mapBitmap) return;
+        mapCanvas.width  = mapBitmap.width;
+        mapCanvas.height = mapBitmap.height;
+        mapCanvas.getContext('2d').drawImage(mapBitmap, 0, 0);
+      }
+
+      function drawCrosshairs(ctx, x, y, visibleLatDeg) {
+        const bounds = readBounds();
+        // Arm length: 20px or proportional, whichever is larger
+        const armLen = Math.max(20, (visibleLatDeg / (bounds.latMax - bounds.latMin)) * mapCanvas.height * 0.15);
+        const boxHalfH = (visibleLatDeg / (bounds.latMax - bounds.latMin)) * mapCanvas.height / 2;
+        const latPerPixel = (bounds.latMax - bounds.latMin) / mapBitmap.height;
+        const lonPerPixel = (bounds.lonMax - bounds.lonMin) / mapBitmap.width;
+        const visibleLonDeg = visibleLatDeg * (lonPerPixel / latPerPixel);  // aspect-correct
+        const boxHalfW = (visibleLonDeg / (bounds.lonMax - bounds.lonMin)) * mapCanvas.width / 2;
+
+        ctx.save();
+        ctx.shadowColor = '#000';
+        ctx.shadowBlur = 4;
+
+        // Bounding box showing estimated visible area
+        ctx.strokeStyle = 'rgba(251, 191, 36, 0.6)';
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([4, 3]);
+        ctx.strokeRect(x - boxHalfW, y - boxHalfH, boxHalfW * 2, boxHalfH * 2);
+        ctx.setLineDash([]);
+
+        // Crosshair lines
+        ctx.strokeStyle = '#f43f5e';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(x - armLen, y); ctx.lineTo(x + armLen, y);
+        ctx.moveTo(x, y - armLen); ctx.lineTo(x, y + armLen);
+        ctx.stroke();
+
+        // Centre dot
+        ctx.fillStyle = '#f43f5e';
+        ctx.beginPath();
+        ctx.arc(x, y, 4, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+
+      function renderMapWithPrediction(lat, lon, visibleLatDeg) {
+        if (!mapBitmap) return;
+        renderMapBase();
+        const bounds = readBounds();
+        if (!boundsValid(bounds)) return;
+        const px = latLonToPixel(lat, lon, bounds, mapCanvas.width, mapCanvas.height);
+        drawCrosshairs(mapCanvas.getContext('2d'), px.x, px.y, visibleLatDeg);
+      }
+
+      // ── Patch preview ──────────────────────────────────────────────────────
+
+      function renderPatch(patch) {
+        const img = new ImageData(REGION_SIZE, REGION_SIZE);
+        for (let i = 0; i < REGION_SIZE * REGION_SIZE; i += 1) {
+          img.data[i * 4]     = Math.max(0, Math.min(255, (patch[i * 3]     + 1) * 127.5));
+          img.data[i * 4 + 1] = Math.max(0, Math.min(255, (patch[i * 3 + 1] + 1) * 127.5));
+          img.data[i * 4 + 2] = Math.max(0, Math.min(255, (patch[i * 3 + 2] + 1) * 127.5));
+          img.data[i * 4 + 3] = 255;
+        }
+        const tmp = document.createElement('canvas');
+        tmp.width = REGION_SIZE; tmp.height = REGION_SIZE;
+        tmp.getContext('2d').putImageData(img, 0, 0);
+        const ctx = patchCanvas.getContext('2d');
+        ctx.imageSmoothingEnabled = false;
+        ctx.clearRect(0, 0, patchCanvas.width, patchCanvas.height);
+        ctx.drawImage(tmp, 0, 0, patchCanvas.width, patchCanvas.height);
+      }
+
+      // ── Inference loop ─────────────────────────────────────────────────────
+
+      function inferenceStep(now) {
+        if (!inferenceActive) return;
+        requestAnimationFrame(inferenceStep);
+
+        if (!model || !mapBitmap || !camStream || camVideo.readyState < 2) return;
+        if (now - lastInferenceMs < INFERENCE_INTERVAL_MS) return;
+        lastInferenceMs = now;
+
+        // Extract centre square from camera frame, rotated north-up by compass heading.
+        // Rotation: -heading so that north (which was heading degrees CW) aligns to top.
+        const vw = camVideo.videoWidth;
+        const vh = camVideo.videoHeight;
+        if (vw === 0 || vh === 0) return;
+
+        const cropSize = Math.min(vw, vh);
+        const scaleFactor = cropSize / REGION_SIZE;
+        const rotationRad = -compassHeading * Math.PI / 180;
+        const patch = extractTransformedPatch(camVideo, vw / 2, vh / 2, scaleFactor, rotationRad, REGION_SIZE, _patchCanvas);
+        renderPatch(patch);
+
+        const output = runBatchInference(gl, programs, model, patch);
+        const { lat, lon, visibleLatDeg } = decodePrediction(output);
+
+        renderMapWithPrediction(lat, lon, visibleLatDeg);
+
+        predStat.innerHTML =
+          `<b>${lat.toFixed(5)}°</b> N &nbsp; <b>${lon.toFixed(5)}°</b> E<br>` +
+          `Scale: <b>${visibleLatDeg.toFixed(4)}°</b> lat visible`;
+        inferStatus.textContent = `Running – heading ${compassHeading.toFixed(0)}°`;
+      }
+
+      function startInference() {
+        inferenceActive = true;
+        requestAnimationFrame(inferenceStep);
+      }
+
+      function stopInference() {
+        inferenceActive = false;
+      }
+
+      // ── Compass / orientation ──────────────────────────────────────────────
+
+      function applyOrientation(event) {
+        let heading;
+        // iOS provides webkitCompassHeading; Android uses absolute DeviceOrientation alpha
+        if (event.webkitCompassHeading !== undefined && event.webkitCompassHeading !== null) {
+          heading = event.webkitCompassHeading;
+        } else if (event.absolute && event.alpha !== null) {
+          heading = event.alpha;
+        } else {
+          return;  // not an absolute orientation event
+        }
+        compassHeading = heading;
+        orientationAuto = true;
+        compassDisplay.textContent = `${Math.round(heading)}°`;
+        compassMode.textContent = 'auto';
+      }
+
+      bearingInput.addEventListener('input', () => {
+        if (!orientationAuto) {
+          compassHeading = parseFloat(bearingInput.value) || 0;
+          compassDisplay.textContent = `${Math.round(compassHeading)}°`;
+        }
+      });
+
+      document.getElementById('requestOrientationBtn').addEventListener('click', async () => {
+        // iOS 13+ requires explicit permission
+        if (typeof DeviceOrientationEvent !== 'undefined' &&
+            typeof DeviceOrientationEvent.requestPermission === 'function') {
+          try {
+            const result = await DeviceOrientationEvent.requestPermission();
+            if (result !== 'granted') {
+              alert('Motion permission denied.');
+              return;
+            }
+          } catch (e) {
+            alert(`Permission error: ${e.message}`);
+            return;
+          }
+        }
+        window.addEventListener('deviceorientationabsolute', applyOrientation);
+        window.addEventListener('deviceorientation',         applyOrientation);
+        compassMode.textContent = 'listening…';
+      });
+
+      // ── Camera ─────────────────────────────────────────────────────────────
+
+      document.getElementById('startCamBtn').addEventListener('click', async () => {
+        try {
+          camStream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: { ideal: 'environment' }, width: { ideal: 640 } },
+          });
+          camVideo.srcObject = camStream;
+          camStatus.textContent = 'Camera active.';
+          document.getElementById('startCamBtn').disabled = true;
+          document.getElementById('stopCamBtn').disabled = false;
+          startInference();
+        } catch (e) {
+          camStatus.textContent = `Camera error: ${e.message}`;
+        }
+      });
+
+      document.getElementById('stopCamBtn').addEventListener('click', () => {
+        stopInference();
+        if (camStream) { camStream.getTracks().forEach((t) => t.stop()); camStream = null; }
+        camVideo.srcObject = null;
+        camStatus.textContent = 'Camera stopped.';
+        document.getElementById('startCamBtn').disabled = false;
+        document.getElementById('stopCamBtn').disabled = true;
+        inferStatus.textContent = 'Camera stopped.';
+      });
+
+      // ── Load model ─────────────────────────────────────────────────────────
+
+      document.getElementById('loadModelBtn').addEventListener('click', async () => {
+        const data = await loadWeightsFromFile();
+        if (!data) return;
+        if (!model) model = createGeoRegressionModel(gl);
+        loadModelWeights(gl, model, data);
+        modelStatus.textContent = 'Model loaded.';
+        inferStatus.textContent = mapBitmap ? 'Ready. Start camera to run inference.' : 'Model loaded. Load a map next.';
+      });
+
+      // ── Load map ───────────────────────────────────────────────────────────
+
+      document.getElementById('loadMapBtn').addEventListener('click', () => {
+        const input = document.createElement('input');
+        input.type = 'file'; input.accept = 'image/*';
+        input.onchange = async () => {
+          const [file] = input.files || [];
+          if (!file) return;
+          mapBitmap = await createImageBitmap(file);
+          renderMapBase();
+          mapStatus.textContent = `${file.name} (${mapBitmap.width}×${mapBitmap.height})`;
+          inferStatus.textContent = model ? 'Ready. Start camera to run inference.' : 'Map loaded. Load a model next.';
+        };
+        input.click();
+      });
+
+      // Re-render map when bounds change
+      [latMinInput, latMaxInput, lonMinInput, lonMaxInput].forEach((inp) => {
+        inp.addEventListener('input', () => { if (mapBitmap) renderMapBase(); });
+      });
+
+      // ── Init ───────────────────────────────────────────────────────────────
+      model = createGeoRegressionModel(gl);
+      modelStatus.textContent = 'Fresh model initialised (load weights to use).';
+    </script>
+  </body>
+</html>

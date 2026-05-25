@@ -1,0 +1,520 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Live Map Location – Training</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { font-family: system-ui, sans-serif; margin: 0; background: #0f172a; color: #e2e8f0; }
+      header, main { padding: 1rem 1.25rem; }
+      header { border-bottom: 1px solid #1e293b; }
+      main { display: grid; grid-template-columns: minmax(340px, 1.3fr) minmax(280px, 1fr); gap: 1rem; }
+      section { background: #111827; border: 1px solid #1f2937; border-radius: 0.75rem; padding: 1rem; }
+      h2 { margin: 0 0 0.6rem; font-size: 1rem; color: #94a3b8; }
+      .controls { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-bottom: 0.75rem; }
+      button, input, select { background: #1e293b; color: #e2e8f0; border: 1px solid #334155; border-radius: 0.5rem; padding: 0.4rem 0.7rem; }
+      button { cursor: pointer; white-space: nowrap; }
+      button:disabled { opacity: 0.45; cursor: default; }
+      input[type="number"] { width: 4.5rem; }
+      input[type="range"] { width: 7rem; }
+      canvas { max-width: 100%; border-radius: 0.5rem; background: #020617; display: block; }
+      .status { color: #94a3b8; font-size: 0.9rem; margin: 0.4rem 0; min-height: 1.2em; }
+      label { display: inline-flex; gap: 0.4rem; align-items: center; font-size: 0.9rem; }
+
+      /* Map entry cards */
+      #mapList { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 0.75rem; max-height: 280px; overflow-y: auto; }
+      .map-entry { display: flex; gap: 0.6rem; align-items: flex-start; background: #0f172a; border: 1px solid #1f2937; border-radius: 0.5rem; padding: 0.5rem; }
+      .map-entry canvas { width: 72px; height: 72px; flex-shrink: 0; cursor: pointer; border-radius: 0.375rem; }
+      .map-entry canvas.selected { outline: 2px solid #38bdf8; }
+      .map-entry .bounds { display: grid; grid-template-columns: 1fr 1fr; gap: 0.3rem; flex: 1; }
+      .map-entry .bounds input { width: 100%; }
+      .map-entry .entry-footer { display: flex; gap: 0.4rem; align-items: center; margin-top: 0.3rem; font-size: 0.8rem; color: #64748b; }
+      .map-entry .entry-footer button { padding: 0.2rem 0.5rem; font-size: 0.8rem; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Live Map Location – Training</h1>
+      <p>Train a ViT regression model to predict latitude, longitude, and visible scale from multi-scale map patches.</p>
+      <p>
+        <a href="inference.html">Go to Inference →</a> &nbsp;|&nbsp;
+        <a href="/">Back to index</a>
+      </p>
+    </header>
+    <main>
+      <!-- Left column: map management + training controls + map preview -->
+      <section>
+        <h2>Maps</h2>
+        <div id="mapList"></div>
+        <div class="controls">
+          <button id="addProceduralBtn">Add procedural map</button>
+          <button id="addImageBtn">Add image…</button>
+        </div>
+
+        <h2>Dataset &amp; Training</h2>
+        <div class="controls">
+          <label>Samples/map <input id="samplesInput" type="number" min="50" max="5000" value="300" /></label>
+          <button id="buildDatasetBtn">Build dataset</button>
+        </div>
+        <div class="controls">
+          <button id="trainBtn" disabled>Train</button>
+          <button id="stopBtn">Stop</button>
+          <button id="resetBtn">Reset model</button>
+          <label>LR <input id="lrInput" type="range" min="0.0002" max="0.01" step="0.0002" value="0.002" /></label>
+          <label>Epochs <input id="epochsInput" type="number" min="1" max="200" value="30" /></label>
+        </div>
+        <div class="controls">
+          <button id="downloadBtn" disabled>Download model</button>
+          <button id="uploadBtn">Upload model</button>
+        </div>
+
+        <h2>Map preview <span id="selectedMapLabel" style="font-weight:normal;color:#64748b">(click thumbnail to select)</span></h2>
+        <canvas id="mapCanvas" width="400" height="300"></canvas>
+        <p class="status" id="status">Load at least one map and click "Build dataset" to start.</p>
+      </section>
+
+      <!-- Right column: loss chart + patch preview + prediction test -->
+      <section>
+        <h2>Training loss</h2>
+        <canvas id="lossCanvas" width="360" height="160"></canvas>
+        <p class="status" id="epochLabel">Epoch: 0</p>
+
+        <h2>Patch preview</h2>
+        <canvas id="patchCanvas" width="256" height="256"></canvas>
+
+        <h2>Prediction test</h2>
+        <p class="status">Click on the map preview to extract a patch at a random scale and run inference.</p>
+        <div class="status" id="predLabel" style="font-size:0.95rem;line-height:1.7"></div>
+      </section>
+    </main>
+
+    <script type="module">
+      import { createWebGL2Context } from '../../src/webgl/context.js';
+      import { buildProgramCache } from '../../src/webgl/program.js';
+      import { MATMUL_SHADERS } from '../../src/ops/matmul.js';
+      import { ELEMENTWISE_SHADERS } from '../../src/ops/elementwise.js';
+      import { REDUCE_SHADERS } from '../../src/ops/reduce.js';
+      import { NORM_SHADERS } from '../../src/ops/norm.js';
+      import { ATTENTION_SHADERS } from '../../src/ops/attention.js';
+      import { PATCH_SHADERS } from '../../src/ops/patch.js';
+      import { TRANSFORMER_SHADERS } from '../../src/layers/transformer.js';
+      import { LOSS_SHADERS } from '../../src/training/loss.js';
+      import { OPTIMIZER_SHADERS } from '../../src/training/optimizer.js';
+      import { createTrainer, trainStep } from '../../src/training/trainer.js';
+      import { downloadModel, loadWeightsFromFile } from '../../src/utils/serialize.js';
+      import { loadModelWeights } from '../../src/inference/model.js';
+      import { runBatchInference } from '../../src/inference/runner.js';
+      import {
+        generateProceduralMap, generateMultiScaleTrainingData,
+        extractTransformedPatch, computePatchLabel, decodePrediction,
+        latLonToPixel, TRAIN_LOG2_SCALE_MIN, TRAIN_LOG2_SCALE_MAX,
+      } from './mapgen.js';
+      import { createGeoRegressionModel, REGION_SIZE, OUTPUT_DIM } from './model.js';
+
+      const shaderSources = {
+        ...MATMUL_SHADERS, ...ELEMENTWISE_SHADERS, ...REDUCE_SHADERS,
+        ...NORM_SHADERS, ...ATTENTION_SHADERS, ...PATCH_SHADERS,
+        ...TRANSFORMER_SHADERS, ...LOSS_SHADERS, ...OPTIMIZER_SHADERS,
+      };
+
+      const gl = createWebGL2Context(document.createElement('canvas'));
+      const programs = buildProgramCache(gl, shaderSources);
+
+      const mapCanvas    = document.getElementById('mapCanvas');
+      const patchCanvas  = document.getElementById('patchCanvas');
+      const lossCanvas   = document.getElementById('lossCanvas');
+      const status       = document.getElementById('status');
+      const epochLabel   = document.getElementById('epochLabel');
+      const predLabel    = document.getElementById('predLabel');
+      const lrInput      = document.getElementById('lrInput');
+      const epochsInput  = document.getElementById('epochsInput');
+      const samplesInput = document.getElementById('samplesInput');
+      const trainBtn     = document.getElementById('trainBtn');
+      const downloadBtn  = document.getElementById('downloadBtn');
+      const mapList      = document.getElementById('mapList');
+      const selectedMapLabel = document.getElementById('selectedMapLabel');
+
+      // State
+      const mapEntries = [];   // { bitmap, width, height, bounds, label }
+      let selectedIndex = -1;
+      let dataset = null;      // { inputs: Float32Array[], labels: Float32Array[] }
+      let model = null;
+      let trainer = null;
+      let lossHistory = [];
+      let stopRequested = false;
+      let proceduralCount = 0;
+
+      // Default lat/lon bounds for procedural maps (cycling through a few areas)
+      const PROCEDURAL_BOUNDS = [
+        { latMin: 40, latMax: 45, lonMin: 10, lonMax: 15, name: 'Central Europe' },
+        { latMin: 50, latMax: 55, lonMin: -5, lonMax:  0, name: 'British Isles' },
+        { latMin: 35, latMax: 40, lonMin: -5, lonMax:  0, name: 'Iberian Peninsula' },
+        { latMin: 45, latMax: 50, lonMin:  2, lonMax:  7, name: 'Eastern France' },
+      ];
+
+      // ── Rendering helpers ──────────────────────────────────────────────────
+
+      function drawLoss() {
+        const ctx = lossCanvas.getContext('2d');
+        ctx.clearRect(0, 0, lossCanvas.width, lossCanvas.height);
+        ctx.fillStyle = '#020617';
+        ctx.fillRect(0, 0, lossCanvas.width, lossCanvas.height);
+        if (lossHistory.length < 2) return;
+        const maxL = Math.max(...lossHistory);
+        const minL = Math.min(...lossHistory);
+        ctx.strokeStyle = '#38bdf8';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        lossHistory.forEach((loss, i) => {
+          const x = (i / Math.max(lossHistory.length - 1, 1)) * lossCanvas.width;
+          const y = lossCanvas.height - ((loss - minL) / Math.max(maxL - minL, 1e-9)) * (lossCanvas.height - 12) - 6;
+          if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+      }
+
+      function renderSelectedMap() {
+        if (selectedIndex < 0 || selectedIndex >= mapEntries.length) return;
+        const { bitmap, width, height } = mapEntries[selectedIndex];
+        const maxPx = 400;
+        const scale = maxPx / Math.max(width, height);
+        mapCanvas.width  = Math.round(width  * scale);
+        mapCanvas.height = Math.round(height * scale);
+        const ctx = mapCanvas.getContext('2d');
+        ctx.clearRect(0, 0, mapCanvas.width, mapCanvas.height);
+        ctx.drawImage(bitmap, 0, 0, mapCanvas.width, mapCanvas.height);
+      }
+
+      function renderPatch(patch) {
+        const img = new ImageData(REGION_SIZE, REGION_SIZE);
+        for (let i = 0; i < REGION_SIZE * REGION_SIZE; i += 1) {
+          img.data[i * 4]     = Math.max(0, Math.min(255, (patch[i * 3]     + 1) * 127.5));
+          img.data[i * 4 + 1] = Math.max(0, Math.min(255, (patch[i * 3 + 1] + 1) * 127.5));
+          img.data[i * 4 + 2] = Math.max(0, Math.min(255, (patch[i * 3 + 2] + 1) * 127.5));
+          img.data[i * 4 + 3] = 255;
+        }
+        const tmp = document.createElement('canvas');
+        tmp.width = REGION_SIZE; tmp.height = REGION_SIZE;
+        tmp.getContext('2d').putImageData(img, 0, 0);
+        const ctx = patchCanvas.getContext('2d');
+        ctx.imageSmoothingEnabled = false;
+        ctx.clearRect(0, 0, patchCanvas.width, patchCanvas.height);
+        ctx.drawImage(tmp, 0, 0, patchCanvas.width, patchCanvas.height);
+      }
+
+      function renderMapWithCrosshairs(predictedPixel, actualPixel) {
+        renderSelectedMap();
+        const ctx = mapCanvas.getContext('2d');
+        // Actual (green)
+        if (actualPixel) drawCrosshairs(ctx, actualPixel.x, actualPixel.y, '#22c55e', 14);
+        // Predicted (sky-blue)
+        drawCrosshairs(ctx, predictedPixel.x, predictedPixel.y, '#38bdf8', 14);
+      }
+
+      function drawCrosshairs(ctx, x, y, color, size) {
+        ctx.save();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.shadowColor = '#000';
+        ctx.shadowBlur = 3;
+        ctx.beginPath();
+        ctx.moveTo(x - size, y); ctx.lineTo(x + size, y);
+        ctx.moveTo(x, y - size); ctx.lineTo(x, y + size);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(x, y, 4, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      // ── Map entry management ───────────────────────────────────────────────
+
+      function addMapEntry(entry) {
+        mapEntries.push(entry);
+        renderMapEntryCard(mapEntries.length - 1);
+        if (selectedIndex < 0) selectMap(0);
+        trainBtn.disabled = true;  // dataset needs rebuild
+        downloadBtn.disabled = true;
+      }
+
+      function removeMapEntry(index) {
+        mapEntries.splice(index, 1);
+        rebuildMapList();
+        if (selectedIndex >= mapEntries.length) selectedIndex = mapEntries.length - 1;
+        if (selectedIndex >= 0) selectMap(selectedIndex); else mapCanvas.getContext('2d').clearRect(0, 0, mapCanvas.width, mapCanvas.height);
+        trainBtn.disabled = true;
+        dataset = null;
+      }
+
+      function selectMap(index) {
+        selectedIndex = index;
+        selectedMapLabel.textContent = mapEntries[index] ? `(${mapEntries[index].label})` : '';
+        document.querySelectorAll('.map-entry canvas').forEach((c, i) => {
+          c.classList.toggle('selected', i === index);
+        });
+        renderSelectedMap();
+      }
+
+      function renderMapEntryCard(index) {
+        const entry = mapEntries[index];
+        const card = document.createElement('div');
+        card.className = 'map-entry';
+        card.dataset.index = index;
+
+        // Thumbnail
+        const thumb = document.createElement('canvas');
+        thumb.width = 72; thumb.height = 72;
+        thumb.getContext('2d').drawImage(entry.bitmap, 0, 0, 72, 72);
+        if (index === selectedIndex) thumb.classList.add('selected');
+        thumb.addEventListener('click', () => selectMap(index));
+        card.appendChild(thumb);
+
+        // Bounds + label
+        const right = document.createElement('div');
+        right.style.flex = '1';
+
+        const boundsDiv = document.createElement('div');
+        boundsDiv.className = 'bounds';
+
+        const fields = [
+          { key: 'latMin', label: 'Lat min' },
+          { key: 'latMax', label: 'Lat max' },
+          { key: 'lonMin', label: 'Lon min' },
+          { key: 'lonMax', label: 'Lon max' },
+        ];
+        for (const { key, label } of fields) {
+          const inp = document.createElement('input');
+          inp.type = 'number'; inp.step = 'any';
+          inp.value = entry.bounds[key];
+          inp.placeholder = label;
+          inp.style.width = '100%';
+          inp.addEventListener('input', () => {
+            const v = parseFloat(inp.value);
+            if (!Number.isFinite(v)) return;
+            entry.bounds[key] = v;
+            trainBtn.disabled = true;  // stale dataset
+            dataset = null;
+          });
+          boundsDiv.appendChild(inp);
+        }
+        right.appendChild(boundsDiv);
+
+        const footer = document.createElement('div');
+        footer.className = 'entry-footer';
+        footer.textContent = entry.label + ' ';
+        const removeBtn = document.createElement('button');
+        removeBtn.textContent = 'Remove';
+        removeBtn.addEventListener('click', () => removeMapEntry(index));
+        footer.appendChild(removeBtn);
+        right.appendChild(footer);
+
+        card.appendChild(right);
+        mapList.appendChild(card);
+      }
+
+      function rebuildMapList() {
+        mapList.innerHTML = '';
+        mapEntries.forEach((_, i) => renderMapEntryCard(i));
+      }
+
+      // ── Dataset building ───────────────────────────────────────────────────
+
+      function buildDataset() {
+        if (mapEntries.length === 0) { status.textContent = 'Add at least one map first.'; return; }
+        const samplesPerMap = Math.max(50, Number(samplesInput.value) || 300);
+        status.textContent = 'Building dataset…';
+        // Use setTimeout to yield to the UI before heavy computation
+        setTimeout(() => {
+          dataset = generateMultiScaleTrainingData(mapEntries, REGION_SIZE, samplesPerMap);
+          status.textContent = `Dataset ready: ${dataset.inputs.length} samples from ${mapEntries.length} map(s).`;
+          trainBtn.disabled = false;
+        }, 10);
+      }
+
+      // ── Model management ───────────────────────────────────────────────────
+
+      function resetModel() {
+        model = createGeoRegressionModel(gl);
+        trainer = createTrainer(gl, programs, model, {
+          lr: Number(lrInput.value),
+          beta1: 0.9, beta2: 0.999, eps: 1e-8,
+          batchSize: 64,
+          loss: 'mse',
+        });
+        lossHistory = [];
+        drawLoss();
+        epochLabel.textContent = 'Epoch: 0';
+        downloadBtn.disabled = true;
+      }
+
+      // Custom batch extraction that preserves Float32Array labels (MSE regression).
+      function getRegressionBatch(inputs, labels, indices, start, end) {
+        const batchSize = end - start;
+        const batchInputs = [];
+        const labelDim = OUTPUT_DIM;
+        const batchLabels = new Float32Array(batchSize * labelDim);
+        for (let i = 0; i < batchSize; i += 1) {
+          batchInputs.push(inputs[indices[start + i]]);
+          batchLabels.set(labels[indices[start + i]], i * labelDim);
+        }
+        return { inputs: batchInputs, labels: batchLabels };
+      }
+
+      function shuffleIndices(n) {
+        const idx = Array.from({ length: n }, (_, i) => i);
+        for (let i = n - 1; i > 0; i -= 1) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [idx[i], idx[j]] = [idx[j], idx[i]];
+        }
+        return idx;
+      }
+
+      // ── Training loop ──────────────────────────────────────────────────────
+
+      async function train() {
+        if (!dataset || !model) return;
+        stopRequested = false;
+        trainer.config.lr = Number(lrInput.value);
+        const epochs = Number(epochsInput.value);
+        const { batchSize } = trainer.config;
+        const yieldEveryMs = 100;
+
+        for (let epoch = 0; epoch < epochs; epoch += 1) {
+          if (stopRequested) break;
+          const indices = shuffleIndices(dataset.inputs.length);
+          const batchCount = Math.ceil(indices.length / batchSize);
+          let totalLoss = 0;
+          let lastYield = performance.now();
+
+          for (let bi = 0; bi < batchCount; bi += 1) {
+            if (stopRequested) break;
+            const start = bi * batchSize;
+            const end = Math.min(start + batchSize, indices.length);
+            const batch = getRegressionBatch(dataset.inputs, dataset.labels, indices, start, end);
+            const { loss } = trainStep(gl, programs, trainer, batch.inputs, batch.labels);
+            totalLoss += loss;
+            const now = performance.now();
+            if (now - lastYield >= yieldEveryMs) {
+              status.textContent = `Epoch ${epoch + 1}/${epochs} · batch ${bi + 1}/${batchCount} · loss ${loss.toFixed(5)}`;
+              await new Promise((r) => setTimeout(r, 0));
+              lastYield = performance.now();
+            }
+          }
+          if (stopRequested) break;
+          const avgLoss = totalLoss / Math.max(batchCount, 1);
+          lossHistory.push(avgLoss);
+          epochLabel.textContent = `Epoch: ${epoch + 1}`;
+          status.textContent = `Epoch ${epoch + 1}/${epochs} · avg loss ${avgLoss.toFixed(5)}`;
+          drawLoss();
+          await new Promise((r) => requestAnimationFrame(r));
+        }
+        downloadBtn.disabled = false;
+      }
+
+      // ── Inference test on map click ────────────────────────────────────────
+
+      const _patchCanvas = document.createElement('canvas');
+      _patchCanvas.width = REGION_SIZE; _patchCanvas.height = REGION_SIZE;
+
+      mapCanvas.addEventListener('click', (event) => {
+        if (!model || selectedIndex < 0) return;
+        const entry = mapEntries[selectedIndex];
+        const rect = mapCanvas.getBoundingClientRect();
+        const canvasX = (event.clientX - rect.left) * (mapCanvas.width  / rect.width);
+        const canvasY = (event.clientY - rect.top)  * (mapCanvas.height / rect.height);
+
+        // Map canvas coordinates back to source image coordinates
+        const srcX = canvasX / mapCanvas.width  * entry.width;
+        const srcY = canvasY / mapCanvas.height * entry.height;
+
+        // Random scale in training range
+        const log2Scale = TRAIN_LOG2_SCALE_MIN + Math.random() * (TRAIN_LOG2_SCALE_MAX - TRAIN_LOG2_SCALE_MIN);
+        const scaleFactor = Math.pow(2, log2Scale);
+        const patch = extractTransformedPatch(entry.bitmap, srcX, srcY, scaleFactor, 0, REGION_SIZE, _patchCanvas);
+        renderPatch(patch);
+
+        const output = runBatchInference(gl, programs, model, patch);
+        const pred = decodePrediction(output);
+
+        // Actual
+        const actualLabel = computePatchLabel(srcX, srcY, entry.width, entry.height, entry.bounds, scaleFactor, REGION_SIZE);
+        const actual = decodePrediction(actualLabel);
+
+        // Canvas pixel positions (using canvas display coords)
+        const predPx  = latLonToPixel(pred.lat,   pred.lon,   entry.bounds, mapCanvas.width, mapCanvas.height);
+        const actPx   = latLonToPixel(actual.lat,  actual.lon, entry.bounds, mapCanvas.width, mapCanvas.height);
+
+        renderMapWithCrosshairs(predPx, actPx);
+
+        predLabel.innerHTML =
+          `<b>Predicted</b>: ${pred.lat.toFixed(4)}°N, ${pred.lon.toFixed(4)}°E · scale ${pred.visibleLatDeg.toFixed(4)}°<br>` +
+          `<b>Actual</b>: ${actual.lat.toFixed(4)}°N, ${actual.lon.toFixed(4)}°E · scale ${actual.visibleLatDeg.toFixed(4)}°<br>` +
+          `<span style="color:#64748b">Scale factor used: ${scaleFactor.toFixed(2)}</span>`;
+      });
+
+      // ── Button wiring ──────────────────────────────────────────────────────
+
+      document.getElementById('addProceduralBtn').addEventListener('click', async () => {
+        const b = PROCEDURAL_BOUNDS[proceduralCount % PROCEDURAL_BOUNDS.length];
+        proceduralCount += 1;
+        const { bitmap, width, height } = await generateProceduralMap(256, 256);
+        addMapEntry({ bitmap, width, height, bounds: { ...b }, label: `Procedural (${b.name})` });
+        status.textContent = `Added procedural map. Rebuild the dataset to include it.`;
+      });
+
+      document.getElementById('addImageBtn').addEventListener('click', () => {
+        const input = document.createElement('input');
+        input.type = 'file'; input.accept = 'image/*';
+        input.onchange = async () => {
+          const [file] = input.files || [];
+          if (!file) return;
+          const bitmap = await createImageBitmap(file);
+          const defaultBounds = { latMin: 40, latMax: 45, lonMin: 10, lonMax: 15 };
+          addMapEntry({
+            bitmap, width: bitmap.width, height: bitmap.height,
+            bounds: defaultBounds, label: file.name,
+          });
+          status.textContent = `Loaded "${file.name}". Edit lat/lon bounds, then rebuild dataset.`;
+        };
+        input.click();
+      });
+
+      document.getElementById('buildDatasetBtn').addEventListener('click', buildDataset);
+
+      document.getElementById('trainBtn').addEventListener('click', () => {
+        if (!model) resetModel();
+        train();
+      });
+
+      document.getElementById('stopBtn').addEventListener('click', () => {
+        stopRequested = true;
+        status.textContent = 'Stopping…';
+      });
+
+      document.getElementById('resetBtn').addEventListener('click', () => {
+        resetModel();
+        predLabel.textContent = '';
+        status.textContent = 'Model reset.';
+      });
+
+      document.getElementById('downloadBtn').addEventListener('click', () => {
+        if (!model) return;
+        downloadModel(gl, model.architecture, model.parameters, 'live-map-location.json');
+      });
+
+      document.getElementById('uploadBtn').addEventListener('click', async () => {
+        const data = await loadWeightsFromFile();
+        if (!data) return;
+        if (!model) resetModel();
+        loadModelWeights(gl, model, data);
+        const arch = data.architecture || data;
+        status.textContent = `Model loaded (architecture: ${JSON.stringify(arch.type ?? 'unknown')}).`;
+        downloadBtn.disabled = false;
+      });
+
+      // ── Initialise ─────────────────────────────────────────────────────────
+      resetModel();
+    </script>
+  </body>
+</html>

@@ -191,8 +191,9 @@
 
       import {
         createEfficientWordNetModel,
-        extractEmbedding, cosineSimilarity, maxCosineSimilarity,
-        serializeBackboneWeights, loadBackboneWeights,
+        extractEmbedding, maxCosineSimilarity,
+        classifyMel, l2Normalize, decayWeights,
+        serializeAllWeights, loadBackboneWeights,
         N_MEL,
       } from './model.js';
 
@@ -220,6 +221,8 @@
       let audioRingBuffer = new Float32Array(WINDOW_SAMPLES);
       let ringWritePos = 0;
       let samplesSinceLastProcess = 0;
+      let samplesCollected = 0;  // Counts samples received since detection started;
+                                 // detection is gated until the ring buffer is fully filled.
       const PROCESS_INTERVAL = Math.floor(SAMPLE_RATE * 0.1);  // every 100 ms
       const MIN_RMS_FOR_DETECTION = 0.005;
       const RELAXATION_FRAMES = 8;  // ignore rapid re-triggers (~800 ms)
@@ -364,10 +367,15 @@
         while (detectionLog.children.length > 12) detectionLog.lastElementChild.remove();
       }
 
-      function updateConfidence(sim) {
-        const pct = Math.max(0, Math.min(100, ((sim + 1) / 2) * 100));
-        confidenceBar.style.width = `${pct}%`;
-        confidenceVal.textContent = sim > -1 ? `${(sim * 100).toFixed(0)}%` : '—';
+      // score: number in [0, 1], or a negative sentinel for "no voice".
+      function updateConfidence(score) {
+        if (score < 0) {
+          confidenceBar.style.width = '0%';
+          confidenceVal.textContent = '—';
+          return;
+        }
+        confidenceBar.style.width = `${score * 100}%`;
+        confidenceVal.textContent = `${(score * 100).toFixed(0)}%`;
       }
 
       // ── Microphone helpers ─────────────────────────────────────────────────
@@ -530,6 +538,9 @@
         // Yield to the browser between epochs so the UI stays responsive
         for (let epoch = 0; epoch < epochs; epoch++) {
           const { avgLoss } = trainEpoch(gl, programs, trainer, dataset);
+          // L2 weight decay on W matrices: prevents catastrophic overfitting to the small
+          // training set. Loss should stabilise around 0.05–0.25 instead of reaching 0.
+          decayWeights(gl, model, 0.003);
           lossHistory.push(avgLoss);
           drawLoss();
           if ((epoch + 1) % 5 === 0 || epoch === epochs - 1) {
@@ -547,23 +558,26 @@
       // ── Phase 4: Reference file ────────────────────────────────────────────
       genRefBtn.addEventListener('click', () => {
         const hotword = hotwordNameInput.value.trim() || 'hotword';
-        // Keep as Float32Arrays in-memory for efficient cosine similarity; serialise via Array.from in saveRefBtn
-        const embeddings = hotwordAudioSamples.map((audio) => {
-          const mel = extractLogMelFeatures(audio);
-          return extractEmbedding(gl, programs, model, mel);
-        });
-        const weights = serializeBackboneWeights(gl, model);
+        const isTrained = lossHistory.length > 0;
+        // L2-normalised mel features: used for cosine-similarity detection when untrained.
+        // Pre-converting to Float32Array avoids re-allocation every detection frame.
+        const melFeatures = hotwordAudioSamples.map((audio) =>
+          l2Normalize(extractLogMelFeatures(audio))
+        );
+        // When trained, store all weights (backbone + head) so the classifier can run at
+        // detection time. When untrained, weights are not needed.
+        const weights = isTrained ? serializeAllWeights(gl, model) : [];
         reference = {
-          version: 1,
+          version: 2,
           hotword,
           created: new Date().toISOString(),
-          sampleCount: embeddings.length,
-          trained: lossHistory.length > 0,
+          sampleCount: melFeatures.length,
+          trained: isTrained,
           nMel: N_MEL,
-          embeddings,
+          melFeatures,
           weights,
         };
-        refStatus.textContent = `Reference generated: "${hotword}" (${embeddings.length} embeddings, trained: ${reference.trained}).`;
+        refStatus.textContent = `Reference generated: "${hotword}" (${melFeatures.length} samples, trained: ${isTrained}).`;
         updateButtonStates();
       });
 
@@ -572,7 +586,8 @@
         // Serialise Float32Arrays to plain arrays for JSON
         const serialisable = {
           ...reference,
-          embeddings: reference.embeddings.map((e) => Array.from(e)),
+          ...(reference.melFeatures && { melFeatures: reference.melFeatures.map((e) => Array.from(e)) }),
+          ...(reference.embeddings  && { embeddings:  reference.embeddings.map((e) => Array.from(e))  }),
         };
         const json = JSON.stringify(serialisable, null, 2);
         const blob = new Blob([json], { type: 'application/json' });
@@ -594,15 +609,17 @@
           try {
             const text = await file.text();
             const data = JSON.parse(text);
-            if (!data.embeddings || !data.weights) throw new Error('Invalid reference file format.');
+            if (!data.melFeatures && !data.embeddings) throw new Error('Invalid reference file: missing features.');
             reference = {
               ...data,
               // Pre-convert to Float32Array for efficient per-frame comparison
-              embeddings: data.embeddings.map((e) => new Float32Array(e)),
+              melFeatures: data.melFeatures?.map((e) => new Float32Array(e)),
+              embeddings:  data.embeddings?.map((e) => new Float32Array(e)),
             };
-            // Restore backbone weights so future embeddings are consistent
-            loadBackboneWeights(gl, model, data.weights);
-            refStatus.textContent = `Loaded: "${reference.hotword}" (${reference.embeddings.length} embeddings, trained: ${reference.trained}).`;
+            // Restore weights. New format includes all 6 arrays; old format had 4 backbone arrays.
+            if (data.weights?.length > 0) loadBackboneWeights(gl, model, data.weights);
+            const featureCount = (reference.melFeatures ?? reference.embeddings).length;
+            refStatus.textContent = `Loaded: "${reference.hotword}" (${featureCount} samples, trained: ${reference.trained}).`;
             updateButtonStates();
           } catch (err) {
             refStatus.textContent = `Error loading file: ${err.message}`;
@@ -636,15 +653,34 @@
         }
 
         const mel = extractLogMelFeatures(window);
-        const emb = extractEmbedding(gl, programs, model, mel);
-        // reference.embeddings are pre-converted to Float32Array when reference is set/loaded
-        const sim = maxCosineSimilarity(emb, reference.embeddings);
 
-        updateConfidence(sim);
+        // Detection strategy depends on how the reference was built:
+        //   trained  → run the full classifier, use softmax probability of hotword class.
+        //              This directly reflects what the model learned from training.
+        //   untrained → cosine similarity on L2-normalised mel features.
+        //              Mel spectral shape is acoustically meaningful without any training.
+        //   old format (v1, embeddings key) → legacy backbone-embedding cosine similarity.
+        let confidence;
+        if (reference.melFeatures) {
+          if (reference.trained) {
+            confidence = classifyMel(gl, programs, model, mel);
+          } else {
+            const normMel = l2Normalize(mel);
+            // Map cosine similarity [-1, 1] to [0, 1] for a consistent threshold scale.
+            const sim = maxCosineSimilarity(normMel, reference.melFeatures);
+            confidence = (sim + 1) / 2;
+          }
+        } else {
+          // Legacy v1 format: backbone embedding cosine similarity
+          const emb = extractEmbedding(gl, programs, model, mel);
+          confidence = (maxCosineSimilarity(emb, reference.embeddings) + 1) / 2;
+        }
+
+        updateConfidence(confidence);
 
         const threshold = Number(thresholdInput.value);
-        if (sim >= threshold && framesUntilNextTrigger <= 0) {
-          setDetected(sim);
+        if (confidence >= threshold && framesUntilNextTrigger <= 0) {
+          setDetected(confidence);
           framesUntilNextTrigger = RELAXATION_FRAMES;
         }
         if (framesUntilNextTrigger > 0) framesUntilNextTrigger--;
@@ -663,6 +699,7 @@
         audioRingBuffer = new Float32Array(WINDOW_SAMPLES);
         ringWritePos = 0;
         samplesSinceLastProcess = 0;
+        samplesCollected = 0;
         framesUntilNextTrigger = 0;
         detectionActive = true;
 
@@ -672,7 +709,10 @@
             ringWritePos = (ringWritePos + 1) % WINDOW_SAMPLES;
             samplesSinceLastProcess++;
           }
-          if (samplesSinceLastProcess >= PROCESS_INTERVAL) {
+          // Gate detection until the ring buffer has been filled with real audio.
+          // This prevents the zero-padded portion at startup from triggering false positives.
+          samplesCollected = Math.min(samplesCollected + chunk.length, WINDOW_SAMPLES);
+          if (samplesSinceLastProcess >= PROCESS_INTERVAL && samplesCollected >= WINDOW_SAMPLES) {
             samplesSinceLastProcess = 0;
             processDetectionWindow();
           }

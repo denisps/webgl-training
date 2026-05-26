@@ -110,26 +110,61 @@ export function maxCosineSimilarity(queryEmbedding, referenceEmbeddings) {
   return max;
 }
 
-// Serialise only the backbone weights (Dense1 + Dense2) for the reference file.
-// The classifier head is not needed for inference.
-export function serializeBackboneWeights(gl, model) {
+// Apply L2 weight decay to weight matrices (not biases). Call once per training epoch to
+// prevent the model from overfitting perfectly to small training sets. A rate of 0.003
+// keeps the loss from reaching 0 and yields a more generalisable model.
+export function decayWeights(gl, model, rate) {
+  for (const layerName of ['dense1', 'dense2', 'head']) {
+    const wTensor = model.weights[layerName].W;
+    const data = readTensor(gl, wTensor);
+    for (let i = 0; i < data.length; i++) data[i] *= (1 - rate);
+    destroyTensor(gl, wTensor);
+    model.weights[layerName].W = createTensor(gl, wTensor.rows, wTensor.cols, data);
+  }
+  model.parameters = flattenWeights(model.weights);
+}
+
+// Run full forward pass and return the softmax probability of the hotword class (class 1).
+// Use this for detection when the model has been trained — it directly reflects what the
+// classifier learned, unlike cosine similarity in embedding space.
+export function classifyMel(gl, programs, model, melFeatures) {
+  const inputTensor = createTensor(gl, 1, N_MEL, new Float32Array(melFeatures));
+  const layer1 = denseFwd(gl, programs, inputTensor, model.weights.dense1, 'relu');
+  const layer2 = denseFwd(gl, programs, layer1.output, model.weights.dense2, 'relu');
+  const head   = denseFwd(gl, programs, layer2.output, model.weights.head, 'linear');
+  const logits  = readTensor(gl, head.output);
+  destroyTensor(gl, inputTensor);
+  destroyTensor(gl, layer1.output);  destroyTensor(gl, layer1.preActivation);
+  destroyTensor(gl, layer2.output);  destroyTensor(gl, layer2.preActivation);
+  destroyTensor(gl, head.output);    destroyTensor(gl, head.preActivation);
+  // Numerically stable softmax over 2 classes
+  const maxLogit = Math.max(logits[0], logits[1]);
+  const e0 = Math.exp(logits[0] - maxLogit);
+  const e1 = Math.exp(logits[1] - maxLogit);
+  return e1 / (e0 + e1);  // probability of hotword (class 1)
+}
+
+// Serialise all model weights (backbone + head) for a trained reference file.
+export function serializeAllWeights(gl, model) {
   return [
     { rows: model.weights.dense1.W.rows, cols: model.weights.dense1.W.cols, data: Array.from(readTensor(gl, model.weights.dense1.W)) },
     { rows: model.weights.dense1.b.rows, cols: model.weights.dense1.b.cols, data: Array.from(readTensor(gl, model.weights.dense1.b)) },
     { rows: model.weights.dense2.W.rows, cols: model.weights.dense2.W.cols, data: Array.from(readTensor(gl, model.weights.dense2.W)) },
     { rows: model.weights.dense2.b.rows, cols: model.weights.dense2.b.cols, data: Array.from(readTensor(gl, model.weights.dense2.b)) },
+    { rows: model.weights.head.W.rows,   cols: model.weights.head.W.cols,   data: Array.from(readTensor(gl, model.weights.head.W)) },
+    { rows: model.weights.head.b.rows,   cols: model.weights.head.b.cols,   data: Array.from(readTensor(gl, model.weights.head.b)) },
   ];
 }
 
-// Restore backbone weights from a serialised array (as produced by serializeBackboneWeights).
+// Restore model weights. Accepts both 4-entry (backbone only, old format) and
+// 6-entry (backbone + head, new format) arrays.
 export function loadBackboneWeights(gl, model, weightsData) {
   const fields = [
-    ['dense1', 'W'],
-    ['dense1', 'b'],
-    ['dense2', 'W'],
-    ['dense2', 'b'],
+    ['dense1', 'W'], ['dense1', 'b'],
+    ['dense2', 'W'], ['dense2', 'b'],
+    ['head',   'W'], ['head',   'b'],
   ];
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < Math.min(weightsData.length, fields.length); i++) {
     const [layer, key] = fields[i];
     const { rows, cols, data } = weightsData[i];
     destroyTensor(gl, model.weights[layer][key]);

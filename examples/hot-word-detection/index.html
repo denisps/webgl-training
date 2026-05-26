@@ -40,11 +40,12 @@
       canvas { display: block; background: #020617; border-radius: 0.35rem; }
 
       /* Sample thumbnails */
-      #sampleList { display: flex; flex-wrap: wrap; gap: 0.3rem; margin-top: 0.3rem; }
+      #sampleList, #negSampleList { display: flex; flex-wrap: wrap; gap: 0.3rem; margin-top: 0.3rem; }
       .thumb { position: relative; cursor: default; }
       .thumb canvas { width: 60px; height: 30px; border-radius: 0.25rem; border: 1px solid #334155; }
-      .thumb .del { position: absolute; top: -4px; right: -4px; width: 14px; height: 14px; background: #ef4444; border-radius: 50%; border: none; padding: 0; font-size: 9px; line-height: 14px; text-align: center; cursor: pointer; color: #fff; display: none; }
-      .thumb:hover .del { display: block; }
+      .thumb .del  { position: absolute; top: -4px; right: -4px; width: 14px; height: 14px; background: #ef4444; border-radius: 50%; border: none; padding: 0; font-size: 9px; line-height: 14px; text-align: center; cursor: pointer; color: #fff; display: none; }
+      .thumb .play { position: absolute; top: -4px; left:  -4px; width: 14px; height: 14px; background: #3b82f6; border-radius: 50%; border: none; padding: 0; font-size: 7px; line-height: 14px; text-align: center; cursor: pointer; color: #fff; display: none; }
+      .thumb:hover .del, .thumb:hover .play { display: block; }
 
       /* Detection indicator */
       #indicator {
@@ -103,9 +104,12 @@
           <p class="hint">Record 3–8 words/phrases that are <em>not</em> the hotword. This is the most important step for preventing false positives on any speech.</p>
           <div class="row">
             <button id="recordNegBtn">⏺ Record phrase</button>
-            <button id="clearNegBtn" disabled>Clear</button>
+            <button id="saveNegBtn" disabled>Save phrases</button>
+            <button id="loadNegBtn">Load phrases</button>
           </div>
           <p class="status" id="negStatus">0 negative samples.</p>
+          <canvas id="waveNegCanvas" width="242" height="56"></canvas>
+          <div id="negSampleList"></div>
         </div>
 
         <!-- Phase 3: Background audio -->
@@ -255,8 +259,11 @@
       const waveCanvas        = document.getElementById('waveCanvas');
       const sampleListEl      = document.getElementById('sampleList');
       const recordNegBtn      = document.getElementById('recordNegBtn');
-      const clearNegBtn       = document.getElementById('clearNegBtn');
+      const saveNegBtn        = document.getElementById('saveNegBtn');
+      const loadNegBtn        = document.getElementById('loadNegBtn');
       const negStatus         = document.getElementById('negStatus');
+      const waveNegCanvas     = document.getElementById('waveNegCanvas');
+      const negSampleListEl   = document.getElementById('negSampleList');
       const recordBgBtn       = document.getElementById('recordBgBtn');
       const synthBgBtn        = document.getElementById('synthBgBtn');
       const bgStatus          = document.getElementById('bgStatus');
@@ -292,7 +299,7 @@
         recordNegBtn.disabled    = detectionActive;
         recordBgBtn.disabled     = detectionActive;
         saveSamplesBtn.disabled  = detectionActive || n === 0;
-        clearNegBtn.disabled     = detectionActive || negativeAudioSamples.length === 0;
+        saveNegBtn.disabled      = detectionActive || negativeAudioSamples.length === 0;
       }
 
       function updateNegStatus() {
@@ -327,26 +334,55 @@
         ctx.stroke();
       }
 
-      function addSampleThumbnail(audio, index) {
+      function playAudio(audioData) {
+        const ctx = new AudioContext({ sampleRate: SAMPLE_RATE });
+        const buffer = ctx.createBuffer(1, audioData.length, SAMPLE_RATE);
+        buffer.copyToChannel(audioData, 0);
+        const source = ctx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(ctx.destination);
+        source.start();
+        source.onended = () => ctx.close();
+      }
+
+      function addSampleThumbnail(audio, index, containerEl, samplesArr, rebuildFn, color) {
         const div = document.createElement('div');
         div.className = 'thumb';
         const cvs = document.createElement('canvas');
         cvs.width = 120; cvs.height = 30;
-        drawWaveform(cvs, audio, '#4ade80');
+        drawWaveform(cvs, audio, color);
+        const play = document.createElement('button');
+        play.className = 'play';
+        play.textContent = '▶';
+        play.title = `Play sample ${index + 1}`;
+        play.onclick = () => playAudio(audio);
         const del = document.createElement('button');
         del.className = 'del';
         del.textContent = '×';
         del.title = `Delete sample ${index + 1}`;
-        del.onclick = () => {
-          hotwordAudioSamples.splice(index, 1);
-          sampleListEl.innerHTML = '';
-          hotwordAudioSamples.forEach((a, i) => addSampleThumbnail(a, i));
-          updateSampleStatus();
-          updateButtonStates();
-        };
+        del.onclick = () => { samplesArr.splice(index, 1); rebuildFn(); };
         div.appendChild(cvs);
+        div.appendChild(play);
         div.appendChild(del);
-        sampleListEl.appendChild(div);
+        containerEl.appendChild(div);
+      }
+
+      function rebuildHotwordThumbnails() {
+        sampleListEl.innerHTML = '';
+        hotwordAudioSamples.forEach((a, i) => addSampleThumbnail(
+          a, i, sampleListEl, hotwordAudioSamples,
+          () => { rebuildHotwordThumbnails(); updateSampleStatus(); updateButtonStates(); },
+          '#4ade80'
+        ));
+      }
+
+      function rebuildNegThumbnails() {
+        negSampleListEl.innerHTML = '';
+        negativeAudioSamples.forEach((a, i) => addSampleThumbnail(
+          a, i, negSampleListEl, negativeAudioSamples,
+          () => { rebuildNegThumbnails(); updateNegStatus(); updateButtonStates(); },
+          '#fb923c'
+        ));
       }
 
       function drawLoss() {
@@ -432,8 +468,7 @@
           const audio = await captureAudio(WINDOW_SAMPLES);
           hotwordAudioSamples.push(audio);
           drawWaveform(waveCanvas, audio);
-          sampleListEl.innerHTML = '';
-          hotwordAudioSamples.forEach((a, i) => addSampleThumbnail(a, i));
+          rebuildHotwordThumbnails();
           updateSampleStatus();
         } catch (err) {
           recordStatus.textContent = `Error: ${err.message}`;
@@ -472,8 +507,7 @@
             if (!Array.isArray(data.samples)) throw new Error('Invalid samples file.');
             hotwordAudioSamples = data.samples.map((s) => new Float32Array(s));
             if (data.hotword) hotwordNameInput.value = data.hotword;
-            sampleListEl.innerHTML = '';
-            hotwordAudioSamples.forEach((a, i) => addSampleThumbnail(a, i));
+            rebuildHotwordThumbnails();
             if (hotwordAudioSamples.length > 0) drawWaveform(waveCanvas, hotwordAudioSamples[hotwordAudioSamples.length - 1]);
             updateSampleStatus();
             updateButtonStates();
@@ -496,6 +530,8 @@
           await ensureMic();
           const audio = await captureAudio(WINDOW_SAMPLES);
           negativeAudioSamples.push(audio);
+          drawWaveform(waveNegCanvas, audio, '#fb923c');
+          rebuildNegThumbnails();
           updateNegStatus();
         } catch (err) {
           negStatus.textContent = `Error: ${err.message}`;
@@ -506,10 +542,37 @@
         }
       });
 
-      clearNegBtn.addEventListener('click', () => {
-        negativeAudioSamples = [];
-        updateNegStatus();
-        updateButtonStates();
+      saveNegBtn.addEventListener('click', () => {
+        const payload = { version: 1, samples: negativeAudioSamples.map((a) => Array.from(a)) };
+        const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${hotwordNameInput.value.trim() || 'hotword'}_negative_samples.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+      });
+
+      loadNegBtn.addEventListener('click', () => {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = '.json,application/json';
+        input.onchange = async () => {
+          const file = input.files?.[0];
+          if (!file) return;
+          try {
+            const data = JSON.parse(await file.text());
+            if (!Array.isArray(data.samples)) throw new Error('Invalid negative samples file.');
+            negativeAudioSamples = data.samples.map((s) => new Float32Array(s));
+            rebuildNegThumbnails();
+            if (negativeAudioSamples.length > 0) drawWaveform(waveNegCanvas, negativeAudioSamples[negativeAudioSamples.length - 1], '#fb923c');
+            updateNegStatus();
+            updateButtonStates();
+          } catch (err) {
+            negStatus.textContent = `Error loading phrases: ${err.message}`;
+          }
+        };
+        input.click();
       });
 
       // ── Phase 3: Background audio ──────────────────────────────────────────

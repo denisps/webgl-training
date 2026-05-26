@@ -97,9 +97,20 @@
           <div id="sampleList"></div>
         </div>
 
-        <!-- Phase 2: Background audio -->
+        <!-- Phase 2: Negative voice samples -->
         <div class="panel">
-          <h2>2. Background Audio <span style="font-weight:normal;text-transform:none;letter-spacing:0">(optional)</span></h2>
+          <h2>2. Other Phrases (Negative)</h2>
+          <p class="hint">Record 3–8 words/phrases that are <em>not</em> the hotword. This is the most important step for preventing false positives on any speech.</p>
+          <div class="row">
+            <button id="recordNegBtn">⏺ Record phrase</button>
+            <button id="clearNegBtn" disabled>Clear</button>
+          </div>
+          <p class="status" id="negStatus">0 negative samples.</p>
+        </div>
+
+        <!-- Phase 3: Background audio -->
+        <div class="panel">
+          <h2>3. Background Audio <span style="font-weight:normal;text-transform:none;letter-spacing:0">(optional)</span></h2>
           <p class="hint">Improves accuracy; used only for training.</p>
           <div class="row">
             <button id="recordBgBtn">Record 3 s</button>
@@ -110,8 +121,8 @@
 
         <!-- Phase 3: Train -->
         <div class="panel">
-          <h2>3. Train Model</h2>
-          <p class="hint">Requires ≥ 4 hotword samples and background audio.</p>
+          <h2>4. Train Model</h2>
+          <p class="hint">Requires ≥ 4 hotword samples. Add negative phrases and background audio for best accuracy.</p>
           <label>
             <div class="label-row"><span>Epochs</span></div>
             <input id="epochsInput" type="number" value="50" min="10" max="300" />
@@ -121,9 +132,9 @@
           <p class="status" id="trainStatus">Not trained.</p>
         </div>
 
-        <!-- Phase 4: Reference file -->
+        <!-- Phase 5: Reference file -->
         <div class="panel">
-          <h2>4. Reference File</h2>
+          <h2>5. Reference File</h2>
           <button id="genRefBtn" disabled>Generate reference</button>
           <div class="row" style="margin-top:0.4rem">
             <button id="saveRefBtn" disabled>Save JSON</button>
@@ -211,6 +222,7 @@
       // ── State ──────────────────────────────────────────────────────────────
       let mic = new MicrophoneCapture();
       let hotwordAudioSamples = [];   // Float32Array[], each WINDOW_SAMPLES long
+      let negativeAudioSamples = [];   // Float32Array[], each WINDOW_SAMPLES long – other words
       let bgMelSamples = [];          // Float32Array[], each N_MEL long (time-averaged mel)
       let reference = null;           // { hotword, created, trained, embeddings, weights }
       let trainer = null;
@@ -242,6 +254,9 @@
       const recordStatus      = document.getElementById('recordStatus');
       const waveCanvas        = document.getElementById('waveCanvas');
       const sampleListEl      = document.getElementById('sampleList');
+      const recordNegBtn      = document.getElementById('recordNegBtn');
+      const clearNegBtn       = document.getElementById('clearNegBtn');
+      const negStatus         = document.getElementById('negStatus');
       const recordBgBtn       = document.getElementById('recordBgBtn');
       const synthBgBtn        = document.getElementById('synthBgBtn');
       const bgStatus          = document.getElementById('bgStatus');
@@ -268,14 +283,21 @@
       function updateButtonStates() {
         const n = hotwordAudioSamples.length;
         genRefBtn.disabled  = n < 4;
-        trainBtn.disabled   = n < 4 || bgMelSamples.length === 0;
+        trainBtn.disabled   = n < 4;
         saveRefBtn.disabled = reference === null;
         startBtn.disabled   = reference === null || detectionActive;
         stopBtn.disabled    = !detectionActive;
         // Disable recording buttons while detection is running (mic handler would conflict)
         recordBtn.disabled       = detectionActive;
+        recordNegBtn.disabled    = detectionActive;
         recordBgBtn.disabled     = detectionActive;
         saveSamplesBtn.disabled  = detectionActive || n === 0;
+        clearNegBtn.disabled     = detectionActive || negativeAudioSamples.length === 0;
+      }
+
+      function updateNegStatus() {
+        const n = negativeAudioSamples.length;
+        negStatus.textContent = `${n} negative sample${n !== 1 ? 's' : ''}.`;
       }
 
       function updateSampleStatus() {
@@ -462,7 +484,35 @@
         input.click();
       });
 
-      // ── Phase 2: Background audio ──────────────────────────────────────────
+      // ── Phase 2: Negative voice samples ──────────────────────────────────
+      recordNegBtn.addEventListener('click', async () => {
+        if (isRecording || isRecordingBg) return;
+        isRecording = true;
+        recordNegBtn.disabled = true;
+        recordNegBtn.textContent = '⏺ Recording…';
+        negStatus.textContent = 'Speak a phrase that is NOT the hotword…';
+
+        try {
+          await ensureMic();
+          const audio = await captureAudio(WINDOW_SAMPLES);
+          negativeAudioSamples.push(audio);
+          updateNegStatus();
+        } catch (err) {
+          negStatus.textContent = `Error: ${err.message}`;
+        } finally {
+          isRecording = false;
+          recordNegBtn.textContent = '⏺ Record phrase';
+          updateButtonStates();
+        }
+      });
+
+      clearNegBtn.addEventListener('click', () => {
+        negativeAudioSamples = [];
+        updateNegStatus();
+        updateButtonStates();
+      });
+
+      // ── Phase 3: Background audio ──────────────────────────────────────────
       recordBgBtn.addEventListener('click', async () => {
         if (isRecording || isRecordingBg) return;
         isRecordingBg = true;
@@ -494,9 +544,9 @@
         updateButtonStates();
       });
 
-      // ── Phase 3: Train model ───────────────────────────────────────────────
+      // ── Phase 4: Train model ───────────────────────────────────────────────
       trainBtn.addEventListener('click', async () => {
-        if (hotwordAudioSamples.length < 4 || bgMelSamples.length === 0) return;
+        if (hotwordAudioSamples.length < 4) return;
         trainBtn.disabled = true;
         trainStatus.textContent = 'Preparing dataset…';
         lossHistory = [];
@@ -505,12 +555,22 @@
         const inputs = [];
         const labels = [];
 
+        // Positive class: hotword
         for (const audio of hotwordAudioSamples) {
           const augmented = generateAugmentations(audio, 15);
           for (const mel of augmented) { inputs.push(mel); labels.push(1); }
         }
 
-        const bgAugs = Math.max(1, Math.ceil((inputs.length / 2) / bgMelSamples.length));
+        // Negative class: other voice phrases (most important for hotword specificity)
+        for (const audio of negativeAudioSamples) {
+          const augmented = generateAugmentations(audio, 15);
+          for (const mel of augmented) { inputs.push(mel); labels.push(0); }
+        }
+
+        // Negative class: background noise / silence
+        const bgAugs = bgMelSamples.length > 0
+          ? Math.max(1, Math.ceil((inputs.length / 2) / bgMelSamples.length))
+          : 0;
         for (const mel of bgMelSamples) {
           // Augment background mel features directly (add noise, scale)
           for (let a = 0; a < bgAugs; a++) {
@@ -522,6 +582,12 @@
             }
             inputs.push(noisy); labels.push(0);
           }
+        }
+
+        // Ensure there are some class-0 examples even if no background/negative provided
+        if (inputs.filter((_, i) => labels[i] === 0).length === 0) {
+          const synthetic = generateSyntheticBackground(6);
+          for (const mel of synthetic) { inputs.push(mel); labels.push(0); }
         }
 
         const dataset = createDataset(inputs, labels);
@@ -550,12 +616,14 @@
           if (epoch % 5 === 4) await new Promise((r) => setTimeout(r, 0));
         }
 
-        trainStatus.textContent = `Done. Final loss: ${lossHistory.at(-1).toFixed(4)}`;
+        const posCount = labels.filter((l) => l === 1).length;
+        const negCount = labels.filter((l) => l === 0).length;
+        trainStatus.textContent = `Done. Final loss: ${lossHistory.at(-1).toFixed(4)}  (${posCount} positive, ${negCount} negative)`;
         trainBtn.disabled = false;
         updateButtonStates();
       });
 
-      // ── Phase 4: Reference file ────────────────────────────────────────────
+      // ── Phase 5: Reference file ────────────────────────────────────────────
       genRefBtn.addEventListener('click', () => {
         const hotword = hotwordNameInput.value.trim() || 'hotword';
         const isTrained = lossHistory.length > 0;

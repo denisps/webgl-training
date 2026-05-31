@@ -2,6 +2,11 @@
 // Implements log mel filterbank features matching the original EfficientWord-Net:
 //   sampleRate=16000, nfft=512, winlen=0.025s, winstep=0.01s, nfilt=64, preemph=0
 
+import { createTensor, destroyTensor, readTensor } from '../../src/webgl/context.js';
+import { matmulBt } from '../../src/ops/matmul.js';
+import { logFwd, scale } from '../../src/ops/elementwise.js';
+import { sumCols } from '../../src/ops/reduce.js';
+
 export const SAMPLE_RATE = 16000;
 export const WINDOW_SAMPLES = 24000;  // 1.5 seconds
 export const WIN_SAMPLES = 400;       // 25 ms frame
@@ -224,4 +229,62 @@ export class MicrophoneCapture {
   get active() {
     return this._audioContext !== null;
   }
+}
+
+// Cache the mel filterbank as a GPU tensor per WebGL context (allocated once on first use).
+const _melFilterTensorCache = new WeakMap();
+
+function getMelFilterTensor(gl) {
+  if (!_melFilterTensorCache.has(gl)) {
+    const flat = new Float32Array(N_MEL * HALF_BINS);
+    for (let m = 0; m < N_MEL; m++) flat.set(MEL_FILTERS[m], m * HALF_BINS);
+    _melFilterTensorCache.set(gl, createTensor(gl, N_MEL, HALF_BINS, flat));
+  }
+  return _melFilterTensorCache.get(gl);
+}
+
+// GPU-accelerated log mel feature extraction.
+// The CPU FFT path computes per-frame power spectra; the mel filterbank application,
+// log transform, and time-averaging run entirely in WebGL shaders.
+// Returns a Float32Array of length N_MEL, identical in semantics to extractLogMelFeatures.
+export function extractLogMelFeaturesGPU(gl, programs, audioBuffer) {
+  let buf = audioBuffer;
+  if (buf.length < WINDOW_SAMPLES) {
+    const padded = new Float32Array(WINDOW_SAMPLES);
+    padded.set(buf);
+    buf = padded;
+  }
+
+  // Compute per-frame power spectra on CPU, reusing the module-level FFT scratch buffers.
+  const powerSpectra = new Float32Array(N_FRAMES * HALF_BINS);
+  for (let frame = 0; frame < N_FRAMES; frame++) {
+    const offset = frame * HOP_SAMPLES;
+    for (let i = 0; i < WIN_SAMPLES; i++) _fftReal[i] = buf[offset + i] * HAMMING_WINDOW[i];
+    _fftReal.fill(0, WIN_SAMPLES);
+    _fftImag.fill(0);
+    fft(_fftReal, _fftImag);
+    const base = frame * HALF_BINS;
+    for (let k = 0; k < HALF_BINS; k++) {
+      powerSpectra[base + k] = (_fftReal[k] * _fftReal[k] + _fftImag[k] * _fftImag[k]) / N_FFT;
+    }
+  }
+
+  // GPU: matmulBt(powerSpec, melFilter) → log → sumCols → scale
+  // powerSpec: [N_FRAMES × HALF_BINS],  melFilter: [N_MEL × HALF_BINS]
+  // matmulBt computes A × B^T → [N_FRAMES × N_MEL]
+  const melFilter   = getMelFilterTensor(gl);
+  const powerTensor = createTensor(gl, N_FRAMES, HALF_BINS, powerSpectra);
+  const melEnergies = matmulBt(gl, programs, powerTensor, melFilter);  // [N_FRAMES × N_MEL]
+  const logMel      = logFwd(gl, programs, melEnergies, 1e-10);        // [N_FRAMES × N_MEL]
+  const summed      = sumCols(gl, programs, logMel);                   // [1 × N_MEL]
+  const averaged    = scale(gl, programs, summed, 1 / N_FRAMES);       // [1 × N_MEL]
+  const result      = readTensor(gl, averaged);
+
+  destroyTensor(gl, powerTensor);
+  destroyTensor(gl, melEnergies);
+  destroyTensor(gl, logMel);
+  destroyTensor(gl, summed);
+  destroyTensor(gl, averaged);
+
+  return result;
 }

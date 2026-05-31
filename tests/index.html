@@ -20,14 +20,16 @@
       import { createWebGL2Context, createTensor, destroyTensor, readTensor } from '../src/webgl/context.js';
       import { buildProgramCache } from '../src/webgl/program.js';
       import { MATMUL_SHADERS, matmul, matmulAt, matmulBt } from '../src/ops/matmul.js';
-      import { ELEMENTWISE_SHADERS, reluFwd, reluBwd, geluFwd } from '../src/ops/elementwise.js';
-      import { REDUCE_SHADERS, softmaxFwd } from '../src/ops/reduce.js';
+      import { ELEMENTWISE_SHADERS, reluFwd, reluBwd, geluFwd, logFwd } from '../src/ops/elementwise.js';
+      import { REDUCE_SHADERS, softmaxFwd, l2NormFwd } from '../src/ops/reduce.js';
       import { NORM_SHADERS, layerNormFwd } from '../src/ops/norm.js';
       import { ATTENTION_SHADERS, scaledDotProductFwd } from '../src/ops/attention.js';
-      import { createDenseWeights, denseFwd } from '../src/layers/dense.js';
+      import { createDenseWeights, denseFwd, denseBwd } from '../src/layers/dense.js';
       import { LOSS_SHADERS, crossEntropyLoss } from '../src/training/loss.js';
       import { OPTIMIZER_SHADERS, createAdamState, adamStep } from '../src/training/optimizer.js';
       import { serializeWeights, deserializeWeights } from '../src/utils/serialize.js';
+      import { createTrainer, trainEpoch } from '../src/training/trainer.js';
+      import { createDataset } from '../src/utils/data.js';
 
       const results = document.getElementById('results');
       const gl = createWebGL2Context(document.createElement('canvas'));
@@ -194,6 +196,194 @@
         assert(parsed[0].rows === 1 && parsed[0].cols === 3, 'Deserialize shape mismatch');
         assertArrayClose(parsed[0].data, new Float32Array([1, 2, 3]));
         tensors.forEach((tensor) => destroyTensor(gl, tensor));
+      });
+
+      await runTest('testLogFwd', () => {
+        const X = createTensor(gl, 1, 3, new Float32Array([1, Math.E, 0]));
+        const Y = logFwd(gl, programs, X, 1e-10);
+        const data = readTensor(gl, Y);
+        assertArrayClose(data.slice(0, 2), new Float32Array([0, 1]), 1e-3);
+        assert(data[2] < -20, `log(near-zero) should be large negative, got ${data[2]}`);
+        [X, Y].forEach((t) => destroyTensor(gl, t));
+      });
+
+      await runTest('testL2NormFwd', () => {
+        // Row 0: [3, 0, 4] → norm 5 → [0.6, 0, 0.8]
+        // Row 1: [1, 1, 0] → norm √2 → [1/√2, 1/√2, 0]
+        const X = createTensor(gl, 2, 3, new Float32Array([3, 0, 4, 1, 1, 0]));
+        const Y = l2NormFwd(gl, programs, X);
+        const data = readTensor(gl, Y);
+        assertArrayClose(Array.from(data.slice(0, 3)), [0.6, 0, 0.8], 1e-4);
+        const s = 1 / Math.sqrt(2);
+        assertArrayClose(Array.from(data.slice(3, 6)), [s, s, 0], 1e-4);
+        [X, Y].forEach((t) => destroyTensor(gl, t));
+      });
+
+      await runTest('testDenseWeightGradient', () => {
+        // For a linear dense layer, dW = input^T @ dOut and db = sum_rows(dOut).
+        const input = createTensor(gl, 2, 3, new Float32Array([1, 2, 3, 4, 5, 6]));
+        const W = createTensor(gl, 3, 2, new Float32Array([1, 0, 0, 1, 1, 1]));
+        const b = createTensor(gl, 1, 2, new Float32Array([0, 0]));
+        const dOut = createTensor(gl, 2, 2, new Float32Array([1, 0, 0, 1]));
+        const { output, preActivation } = denseFwd(gl, programs, input, { W, b }, 'linear');
+        const { dW, db, dInput } = denseBwd(gl, programs, input, { W, b }, preActivation, dOut, 'linear');
+        // Expected dW = input^T @ dOut
+        const expectedDW = matmulAt(gl, programs, input, dOut);
+        assertArrayClose(readTensor(gl, dW), readTensor(gl, expectedDW));
+        // Expected db = col sums of dOut = [1, 1]
+        assertArrayClose(readTensor(gl, db), new Float32Array([1, 1]));
+        [input, W, b, dOut, output, preActivation, dW, db, dInput, expectedDW].forEach((t) => destroyTensor(gl, t));
+      });
+
+      await runTest('testNumericalGradient', () => {
+        // Finite-difference gradient check on Dense(3→2, linear) + cross-entropy.
+        // Analytical dW must agree with (loss(W+eps) - loss(W-eps)) / 2eps for each weight.
+        const W = createTensor(gl, 3, 2, new Float32Array([0.1, -0.2, 0.3, -0.1, 0.2, -0.3]));
+        const b = createTensor(gl, 1, 2, new Float32Array([0.05, -0.05]));
+        const input = createTensor(gl, 1, 3, new Float32Array([0.5, -0.3, 0.8]));
+        const label = new Int32Array([1]);
+
+        const { output, preActivation } = denseFwd(gl, programs, input, { W, b }, 'linear');
+        const { loss: baseLoss, dLogits } = crossEntropyLoss(gl, programs, output, label);
+        const { dW, db: dBias, dInput } = denseBwd(gl, programs, input, { W, b }, preActivation, dLogits, 'linear');
+        const analyticalDW = readTensor(gl, dW);
+
+        const wData = readTensor(gl, W);
+        const eps = 1e-3;
+
+        const computePerturbedLoss = (idx, delta) => {
+          const perturbed = wData.slice();
+          perturbed[idx] += delta;
+          const pW = createTensor(gl, 3, 2, perturbed);
+          const { output: pOut, preActivation: pPre } = denseFwd(gl, programs, input, { W: pW, b }, 'linear');
+          const { loss: pLoss, dLogits: pDL } = crossEntropyLoss(gl, programs, pOut, label);
+          [pW, pOut, pPre, pDL].forEach((t) => destroyTensor(gl, t));
+          return pLoss;
+        };
+
+        for (let i = 0; i < wData.length; i++) {
+          const numGrad = (computePerturbedLoss(i, eps) - computePerturbedLoss(i, -eps)) / (2 * eps);
+          if (!approx(numGrad, analyticalDW[i], 5e-3)) {
+            throw new Error(`W[${i}]: numerical=${numGrad.toFixed(5)} analytical=${analyticalDW[i].toFixed(5)}`);
+          }
+        }
+
+        [W, b, input, output, preActivation, dLogits, dW, dBias, dInput].forEach((t) => destroyTensor(gl, t));
+      });
+
+      await runTest('testTrainingConverges', () => {
+        // 4-sample linearly separable problem: train a small MLP 60 epochs and verify convergence.
+        const trainInputs = [
+          new Float32Array([1, 0, 0, 0]),
+          new Float32Array([0.9, 0.1, 0, 0]),
+          new Float32Array([0, 0, 1, 0]),
+          new Float32Array([0, 0, 0.9, 0.1]),
+        ];
+        const dataset = createDataset(trainInputs, [1, 1, 0, 0]);
+
+        const w = { dense1: createDenseWeights(gl, 4, 8), head: createDenseWeights(gl, 8, 2) };
+        const model = {
+          parameters: [w.dense1.W, w.dense1.b, w.head.W, w.head.b],
+          weights: w,
+          forward: (gl, programs, input, wt) => {
+            const h = denseFwd(gl, programs, input, wt.dense1, 'relu');
+            const out = denseFwd(gl, programs, h.output, wt.head, 'linear');
+            return { output: out.output, cache: { h, out } };
+          },
+          backward: (gl, programs, input, wt, cache, dOut) => {
+            const gHead = denseBwd(gl, programs, cache.h.output, wt.head, cache.out.preActivation, dOut, 'linear');
+            const g1 = denseBwd(gl, programs, input, wt.dense1, cache.h.preActivation, gHead.dInput, 'relu');
+            destroyTensor(gl, gHead.dInput);
+            return { dInput: g1.dInput, gradients: [g1.dW, g1.db, gHead.dW, gHead.db] };
+          },
+          disposeCache: (gl, cache) => {
+            destroyTensor(gl, cache.h.output);
+            destroyTensor(gl, cache.h.preActivation);
+            destroyTensor(gl, cache.out.preActivation);
+          },
+        };
+
+        const trainer = createTrainer(gl, programs, model, { lr: 0.05, beta1: 0.9, beta2: 0.999, eps: 1e-8, batchSize: 4 });
+
+        let finalLoss = Infinity;
+        for (let epoch = 0; epoch < 60; epoch += 1) {
+          const { avgLoss } = trainEpoch(gl, programs, trainer, dataset);
+          finalLoss = avgLoss;
+        }
+
+        assert(finalLoss < 0.3, `Training did not converge: final loss=${finalLoss.toFixed(4)}`);
+        [w.dense1.W, w.dense1.b, w.head.W, w.head.b].forEach((t) => destroyTensor(gl, t));
+        trainer.adamState.m.forEach((t) => destroyTensor(gl, t));
+        trainer.adamState.v.forEach((t) => destroyTensor(gl, t));
+      });
+
+      await runTest('testSerializeRoundTrip', () => {
+        // Train briefly, serialize weights, restore into a new model, verify loss is unchanged
+        // and continues to decrease with further training.
+        const trainInputs = [new Float32Array([1, 0]), new Float32Array([0, 1])];
+        const dataset = createDataset(trainInputs, [1, 0]);
+
+        const makeModel = (wt) => ({
+          parameters: [wt.head.W, wt.head.b],
+          weights: wt,
+          forward: (gl, programs, input, w) => {
+            const out = denseFwd(gl, programs, input, w.head, 'linear');
+            return { output: out.output, cache: { out } };
+          },
+          backward: (gl, programs, input, w, cache, dOut) => {
+            const g = denseBwd(gl, programs, input, w.head, cache.out.preActivation, dOut, 'linear');
+            return { dInput: g.dInput, gradients: [g.dW, g.db] };
+          },
+          disposeCache: (gl, cache) => { destroyTensor(gl, cache.out.preActivation); },
+        });
+
+        const w1 = { head: createDenseWeights(gl, 2, 2) };
+        const model1 = makeModel(w1);
+        const cfg = { lr: 0.1, beta1: 0.9, beta2: 0.999, eps: 1e-8, batchSize: 2 };
+        const trainer1 = createTrainer(gl, programs, model1, cfg);
+
+        for (let i = 0; i < 10; i += 1) trainEpoch(gl, programs, trainer1, dataset);
+
+        // Capture loss before serialize
+        const inputT = createTensor(gl, 2, 2, new Float32Array([1, 0, 0, 1]));
+        const { output: preOut, preActivation: prePre } = denseFwd(gl, programs, inputT, w1.head, 'linear');
+        const { loss: lossBefore, dLogits: dPre } = crossEntropyLoss(gl, programs, preOut, new Int32Array([1, 0]));
+        [preOut, prePre, dPre].forEach((t) => destroyTensor(gl, t));
+
+        // Serialize and restore
+        const json = serializeWeights(gl, [w1.head.W, w1.head.b]);
+        const restored = deserializeWeights(json);
+        const w2 = {
+          head: {
+            W: createTensor(gl, restored[0].rows, restored[0].cols, restored[0].data),
+            b: createTensor(gl, restored[1].rows, restored[1].cols, restored[1].data),
+          },
+        };
+        const model2 = makeModel(w2);
+
+        // Loss from restored weights must match loss before serialize
+        const { output: restOut, preActivation: restPre } = denseFwd(gl, programs, inputT, w2.head, 'linear');
+        const { loss: lossAfterRestore, dLogits: dRest } = crossEntropyLoss(gl, programs, restOut, new Int32Array([1, 0]));
+        [restOut, restPre, dRest].forEach((t) => destroyTensor(gl, t));
+
+        assert(approx(lossAfterRestore, lossBefore, 1e-3),
+          `Restored weights give different loss: ${lossAfterRestore.toFixed(5)} vs ${lossBefore.toFixed(5)}`);
+
+        // Continue training and verify loss keeps declining
+        const trainer2 = createTrainer(gl, programs, model2, cfg);
+        let finalLoss = Infinity;
+        for (let i = 0; i < 10; i += 1) {
+          const { avgLoss } = trainEpoch(gl, programs, trainer2, dataset);
+          finalLoss = avgLoss;
+        }
+        assert(finalLoss < lossBefore, `Loss did not decrease after restoring: ${finalLoss.toFixed(5)} vs ${lossBefore.toFixed(5)}`);
+
+        destroyTensor(gl, inputT);
+        [w1.head.W, w1.head.b, w2.head.W, w2.head.b].forEach((t) => destroyTensor(gl, t));
+        trainer1.adamState.m.forEach((t) => destroyTensor(gl, t));
+        trainer1.adamState.v.forEach((t) => destroyTensor(gl, t));
+        trainer2.adamState.m.forEach((t) => destroyTensor(gl, t));
+        trainer2.adamState.v.forEach((t) => destroyTensor(gl, t));
       });
     </script>
   </body>

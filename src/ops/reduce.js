@@ -53,6 +53,19 @@ void main() {
   }
   outColor = sumValue;
 }`,
+  l2NormFwd: `${HEADER}
+uniform int u_N;
+uniform float u_Eps;
+void main() {
+  int col = int(gl_FragCoord.x);
+  int row = int(gl_FragCoord.y);
+  float sumSq = 0.0;
+  for (int n = 0; n < u_N; n++) {
+    float v = texelFetch(u_X, ivec2(n, row), 0).r;
+    sumSq += v * v;
+  }
+  outColor = texelFetch(u_X, ivec2(col, row), 0).r / (sqrt(sumSq) + u_Eps);
+}`,
 };
 
 export function softmaxFwd(gl, programs, X) {
@@ -78,6 +91,16 @@ export function sumCols(gl, programs, A) {
   executePass(gl, programs.sumCols, {
     u_X: A.texture,
     u_M: A.rows,
+  }, output, programs.__quadBuffer);
+  return output;
+}
+
+export function l2NormFwd(gl, programs, X, eps = 1e-8) {
+  const output = createTensor(gl, X.rows, X.cols);
+  executePass(gl, programs.l2NormFwd, {
+    u_X: X.texture,
+    u_N: X.cols,
+    u_Eps: eps,
   }, output, programs.__quadBuffer);
   return output;
 }

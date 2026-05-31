@@ -100,6 +100,14 @@ void main() {
   float bias = texelFetch(u_B, ivec2(col, 0), 0).r;
   outColor = a + bias;
 }`,
+  logFwd: `${HEADER}
+uniform float u_Eps;
+void main() {
+  int col = int(gl_FragCoord.x);
+  int row = int(gl_FragCoord.y);
+  float x = texelFetch(u_A, ivec2(col, row), 0).r;
+  outColor = log(max(x, u_Eps));
+}`,
 };
 
 function unary(gl, programs, name, A, extraUniforms = {}) {
@@ -157,4 +165,8 @@ export function addBias(gl, programs, A, bias) {
     u_B: bias.texture,
   }, output, programs.__quadBuffer);
   return output;
+}
+
+export function logFwd(gl, programs, X, eps = 1e-10) {
+  return unary(gl, programs, 'logFwd', X, { u_Eps: eps });
 }
